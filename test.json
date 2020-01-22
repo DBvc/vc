@@ -1,0 +1,7 @@
+{
+  "title": "cities",
+  "cities": [
+    { "name": "Xi'an", "zips": [710000] },
+    { "name": "Shanghai", "zips": [210000] }
+  ]
+}

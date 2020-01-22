@@ -1,8 +1,8 @@
 # vc-cli
 Command Line Tools
 
-- vc-cli clone github
-- vc-cli clone gitlab
+- vc clone github
+- vc clone gitlab
 
 - cd dir
 - git config --local user.name xxx
@@ -10,7 +10,7 @@ Command Line Tools
 
 ## command
 
-### vc-cli clone <configName> <repo>
+### vc clone <configName> <repo>
 
 ```lisp
 ((config "gitlab"
