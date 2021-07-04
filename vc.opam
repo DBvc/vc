@@ -1,0 +1,12 @@
+opam-version: "2.0"
+name: "vc"
+version: "0.1"
+synopsis: "A cli"
+description: "vc cli demo"
+maintainer: "dbvcbetter@gmail.com"
+author: "dbvcbetter@gmail.com"
+license: "MIT"
+homepage: "https://github.com/dbvc/vc"
+bug-reports: "https://github.com/dbvc/vc/issues"
+depends: ["ocaml" "dune" "core" "cryptokit"]
+build: ["dune" "build" "md5.exe"]
