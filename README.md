@@ -1,30 +1,45 @@
-# vc-cli
-Command Line Tools
+# vc
 
-- vc clone github
-- vc clone gitlab
+Developer command line tools.
 
-- cd dir
-- git config --local user.name xxx
-- git config --local user.email xxx
+`vc` is an OCaml/Dune CLI. It currently provides:
 
-## command
+- `vc md5 FILE`: print an MD5 digest for a file.
+- `vc mww ...`: manage local multi-repo Git worktree workspaces.
 
-### vc clone <configName> <repo>
+## Build
 
-```lisp
-((config "gitlab"
-   (user
-     ((name "ys")
-      (email "ys@dbvc.xyz"))))
- (config "github"
-   (user
-     ((name "dbvc")
-      (email "dbvcbetter@gmail.com")))))
+```sh
+opam install . --deps-only
+dune build
+dune exec ./bin/main.exe -- --help
 ```
 
-### config
+## Install
 
-### help
+The opam package is `vc-cli`; the installed executable is `vc`.
 
-### 
+```sh
+opam install .
+vc --help
+```
+
+## mww
+
+`mww` turns a multi-repository feature into a local workspace: one task directory,
+many Git worktrees, independent branches and merge requests.
+
+```sh
+vc mww init ~/dev/company
+cd ~/dev/company
+vc mww repo add frontend git@gitlab.example.com:team/frontend.git
+vc mww repo add backend git@gitlab.example.com:team/backend.git
+vc mww ws new FEAT-123-login frontend backend --title "Login flow refactor"
+vc mww ws status FEAT-123-login
+vc mww run FEAT-123-login -- git status --short
+vc mww push FEAT-123-login
+vc mww mr create FEAT-123-login
+```
+
+Most `mww` commands accept `--json` for machine-readable output. Git is required;
+`glab` is optional and is only needed for `vc mww mr create`.
