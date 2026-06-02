@@ -24,18 +24,63 @@ let render_branch_template ~template ~workspace ~repo =
   |> Text.replace_all ~pattern:"{workspace}" ~with_:workspace
   |> Text.replace_all ~pattern:"{repo}" ~with_:repo
 
+type base_choice = { value : string; explicit : bool }
+
 let repo_base (loaded : Config.loaded) (repo : Types.repo) override_base =
   match override_base with
-  | Some base -> base
+  | Some base -> { value = base; explicit = true }
   | None -> (
       match repo.Types.default_base with
-      | Some base -> base
-      | None -> loaded.Config.config.default_base)
+      | Some base -> { value = base; explicit = true }
+      | None -> { value = loaded.Config.config.default_base; explicit = false })
 
-let repo_target_branch (loaded : Config.loaded) (repo : Types.repo) =
+let branch_of_origin_ref ref =
+  let prefix = "origin/" in
+  let prefix_len = String.length prefix in
+  if String.length ref > prefix_len && String.sub ref 0 prefix_len = prefix then
+    let branch = String.sub ref prefix_len (String.length ref - prefix_len) in
+    if branch = "HEAD" then None else Some branch
+  else None
+
+let rec first_existing_ref ~repo_path = function
+  | [] -> Ok None
+  | ref :: rest ->
+      let* exists = Git.ref_exists ~cwd:repo_path ref in
+      if exists then Ok (Some ref) else first_existing_ref ~repo_path rest
+
+let resolve_repo_base ~repo_path ~repo_name (base : base_choice) ~remote_default_ref =
+  let* exists = Git.ref_exists ~cwd:repo_path base.value in
+  if exists then Ok base.value
+  else if base.explicit then
+    Error
+      (Printf.sprintf "base %s does not exist for repo %s; pass --base or update repo config"
+         base.value repo_name)
+  else
+    let candidates =
+      [ remote_default_ref; Some "origin/master"; Some "origin/main" ]
+      |> List.filter_map Fun.id
+      |> List.filter (fun ref -> ref <> base.value)
+    in
+    let* fallback = first_existing_ref ~repo_path candidates in
+    match fallback with
+    | Some ref -> Ok ref
+    | None ->
+        Error
+          (Printf.sprintf
+             "default base %s does not exist for repo %s and no remote default branch was found"
+             base.value repo_name)
+
+let repo_target_branch (loaded : Config.loaded) (repo : Types.repo) ~base ~remote_default_branch =
   match repo.Types.target_branch with
   | Some branch -> branch
-  | None -> loaded.Config.config.default_target_branch
+  | None ->
+      let configured = loaded.Config.config.default_target_branch in
+      if configured <> "main" then configured
+      else
+        match remote_default_branch with
+        | Some branch -> branch
+        | None -> (
+            match branch_of_origin_ref base with Some branch -> branch | None -> configured)
 
 let ensure_source_clone (loaded : Config.loaded) (repo : Types.repo) =
   let source_path = Config.repo_source_path loaded repo in
@@ -132,10 +177,17 @@ let create ~(loaded : Config.loaded) ~id ?title ?base ?branch_template repo_name
           | (repo : Types.repo) :: rest ->
               let* source_path = ensure_source_clone loaded repo in
               let* () = Git.fetch ~repo_path:source_path in
+              let* remote_default_ref = Git.remote_default_ref ~repo_path:source_path in
+              let remote_default_branch =
+                match remote_default_ref with Some ref -> branch_of_origin_ref ref | None -> None
+              in
               let branch = render_branch_template ~template ~workspace:id ~repo:repo.name in
               let worktree_path = Filename.concat workspace_root repo.name in
-              let base = repo_base loaded repo base in
-              let target_branch = repo_target_branch loaded repo in
+              let* base =
+                resolve_repo_base ~repo_path:source_path ~repo_name:repo.name
+                  (repo_base loaded repo base) ~remote_default_ref
+              in
+              let target_branch = repo_target_branch loaded repo ~base ~remote_default_branch in
               let* _ = Git.worktree_add ~repo_path:source_path ~branch ~dest:worktree_path ~base in
               let workspace_repo =
                 {

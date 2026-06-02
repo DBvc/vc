@@ -19,6 +19,19 @@ let clone ~url ~dest =
 
 let fetch ~repo_path = require ~cwd:repo_path [ "fetch"; "origin" ] |> Result.map ignore
 
+let ref_exists ~cwd ref =
+  let* completed = run ~cwd [ "rev-parse"; "--verify"; "--quiet"; ref ^ "^{commit}" ] in
+  Ok (completed.Proc.exit_code = 0)
+
+let remote_default_ref ~repo_path =
+  let* completed =
+    run ~cwd:repo_path [ "symbolic-ref"; "--quiet"; "--short"; "refs/remotes/origin/HEAD" ]
+  in
+  if completed.Proc.exit_code = 0 then
+    let value = Proc.output_trimmed completed in
+    Ok (if value = "" then None else Some value)
+  else Ok None
+
 let worktree_add ~repo_path ~branch ~dest ~base =
   if Fs.path_exists dest then Error (dest ^ " already exists")
   else

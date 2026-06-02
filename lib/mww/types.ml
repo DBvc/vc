@@ -80,7 +80,7 @@ let default_config ?(root = ".") () =
     root;
     repos_dir = "repos";
     workspaces_dir = "workspaces";
-    default_base = "origin/main";
+    default_base = "origin/HEAD";
     default_target_branch = "main";
     branch_template = "{user}/{workspace}/{repo}";
     gitlab = default_gitlab_config;
@@ -144,7 +144,7 @@ let config_of_yojson json =
   let* root = J.string_with_default ~default:"." "root" json in
   let* repos_dir = J.string_with_default ~default:"repos" "repos_dir" json in
   let* workspaces_dir = J.string_with_default ~default:"workspaces" "workspaces_dir" json in
-  let* default_base = J.string_with_default ~default:"origin/main" "default_base" json in
+  let* default_base = J.string_with_default ~default:"origin/HEAD" "default_base" json in
   let* default_target_branch = J.string_with_default ~default:"main" "default_target_branch" json in
   let* branch_template =
     J.string_with_default ~default:"{user}/{workspace}/{repo}" "branch_template" json
