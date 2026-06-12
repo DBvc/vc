@@ -18,6 +18,14 @@ let selected_repos (loaded : Config.loaded) names =
     in
     loop [] names
 
+let duplicate_name names =
+  let rec loop seen = function
+    | [] -> None
+    | name :: rest ->
+        if List.mem name seen then Some name else loop (name :: seen) rest
+  in
+  loop [] names
+
 let render_branch_template ~template ~workspace ~repo =
   template
   |> Text.replace_all ~pattern:"{user}" ~with_:(Fs.current_user ())
@@ -90,6 +98,34 @@ let ensure_source_clone (loaded : Config.loaded) (repo : Types.repo) =
     ignore cloned;
     Ok source_path
 
+let create_workspace_repo ~(loaded : Config.loaded) ~workspace_id ~workspace_root ~template ?base
+    (repo : Types.repo) =
+  let* source_path = ensure_source_clone loaded repo in
+  let* () = Git.fetch ~repo_path:source_path in
+  let* remote_default_ref = Git.remote_default_ref ~repo_path:source_path in
+  let remote_default_branch =
+    match remote_default_ref with Some ref -> branch_of_origin_ref ref | None -> None
+  in
+  let branch = render_branch_template ~template ~workspace:workspace_id ~repo:repo.name in
+  let worktree_path = Filename.concat workspace_root repo.name in
+  let* base =
+    resolve_repo_base ~repo_path:source_path ~repo_name:repo.name (repo_base loaded repo base)
+      ~remote_default_ref
+  in
+  let target_branch = repo_target_branch loaded repo ~base ~remote_default_branch in
+  let* _ = Git.worktree_add ~repo_path:source_path ~branch ~dest:worktree_path ~base in
+  Ok
+    {
+      Types.name = repo.name;
+      url = repo.url;
+      source_path;
+      worktree_path;
+      base;
+      branch;
+      target_branch;
+      mr_url = None;
+    }
+
 let write_vscode_workspace workspace_root (workspace : Types.workspace) =
   let folders =
     workspace.Types.repos
@@ -154,6 +190,20 @@ let rollback_created_workspace workspace_root workspace_id created_repos =
   (match Fs.rmdir_if_empty workspace_root with Ok () -> () | Error message -> note_error message);
   match List.rev !errors with [] -> None | errors -> Some (String.concat "; " errors)
 
+let rollback_workspace_repos created_repos =
+  let errors = ref [] in
+  let note_error message = errors := message :: !errors in
+  List.iter
+    (fun (repo : Types.workspace_repo) ->
+      match
+        Git.worktree_remove ~force:true ~repo_path:repo.Types.source_path ~dest:repo.worktree_path
+          ()
+      with
+      | Ok _ -> ()
+      | Error message -> note_error message)
+    created_repos;
+  match List.rev !errors with [] -> None | errors -> Some (String.concat "; " errors)
+
 let create ~(loaded : Config.loaded) ~id ?title ?base ?branch_template repo_names =
   let workspace_root = Config.workspace_root loaded id in
   if Fs.path_exists workspace_root then Error (workspace_root ^ " already exists")
@@ -175,31 +225,8 @@ let create ~(loaded : Config.loaded) ~id ?title ?base ?branch_template repo_name
         let rec loop acc = function
           | [] -> Ok (List.rev acc)
           | (repo : Types.repo) :: rest ->
-              let* source_path = ensure_source_clone loaded repo in
-              let* () = Git.fetch ~repo_path:source_path in
-              let* remote_default_ref = Git.remote_default_ref ~repo_path:source_path in
-              let remote_default_branch =
-                match remote_default_ref with Some ref -> branch_of_origin_ref ref | None -> None
-              in
-              let branch = render_branch_template ~template ~workspace:id ~repo:repo.name in
-              let worktree_path = Filename.concat workspace_root repo.name in
-              let* base =
-                resolve_repo_base ~repo_path:source_path ~repo_name:repo.name
-                  (repo_base loaded repo base) ~remote_default_ref
-              in
-              let target_branch = repo_target_branch loaded repo ~base ~remote_default_branch in
-              let* _ = Git.worktree_add ~repo_path:source_path ~branch ~dest:worktree_path ~base in
-              let workspace_repo =
-                {
-                  Types.name = repo.name;
-                  url = repo.url;
-                  source_path;
-                  worktree_path;
-                  base;
-                  branch;
-                  target_branch;
-                  mr_url = None;
-                }
+              let* workspace_repo =
+                create_workspace_repo ~loaded ~workspace_id:id ~workspace_root ~template ?base repo
               in
               created_repos := workspace_repo :: !created_repos;
               loop (workspace_repo :: acc) rest
@@ -215,6 +242,97 @@ let create ~(loaded : Config.loaded) ~id ?title ?base ?branch_template repo_name
         Ok (meta_path, workspace)
     in
     match result with Ok _ as ok -> ok | Error message -> rollback_error message
+
+let restore_file path = function
+  | Some contents -> Fs.write_file path contents
+  | None -> Fs.remove_file_if_exists path
+
+let restore_files backups =
+  let errors = ref [] in
+  let note_error message = errors := message :: !errors in
+  List.iter
+    (fun (path, contents) ->
+      match restore_file path contents with Ok () -> () | Error message -> note_error message)
+    backups;
+  match List.rev !errors with [] -> None | errors -> Some (String.concat "; " errors)
+
+let read_optional_file path =
+  if Fs.path_exists path then Fs.read_file path |> Result.map Option.some else Ok None
+
+let workspace_contains_repo (workspace : Types.workspace) name =
+  List.exists (fun (repo : Types.workspace_repo) -> repo.Types.name = name) workspace.repos
+
+let validate_add_repos ~(workspace : Types.workspace) ~workspace_root repos =
+  let rec loop = function
+    | [] -> Ok ()
+    | (repo : Types.repo) :: rest ->
+        if workspace_contains_repo workspace repo.name then
+          Error (Printf.sprintf "repo already in workspace %s: %s" workspace.id repo.name)
+        else
+          let worktree_path = Filename.concat workspace_root repo.name in
+          if Fs.path_exists worktree_path then Error (worktree_path ^ " already exists")
+          else loop rest
+  in
+  loop repos
+
+let add_repos ~(loaded : Config.loaded) ~workspace_path ~(workspace : Types.workspace) ?base
+    ?branch_template repo_names =
+  match repo_names with
+  | [] -> Error "repo name is required"
+  | _ -> (
+      match duplicate_name repo_names with
+      | Some name -> Error ("duplicate repo: " ^ name)
+      | None ->
+          let workspace_root = Filename.dirname workspace_path in
+          let template =
+            match branch_template with Some value -> value | None -> loaded.config.branch_template
+          in
+          let created_repos = ref [] in
+          let backups = ref None in
+          let rollback_error message =
+            let rollback_message = rollback_workspace_repos !created_repos in
+            let restore_message =
+              match !backups with Some backups -> restore_files backups | None -> None
+            in
+            let details =
+              [ rollback_message; restore_message ] |> List.filter_map Fun.id
+              |> String.concat "; "
+            in
+            if details = "" then Error message else Error (message ^ "\nrollback failed: " ^ details)
+          in
+          let result =
+            let* repos = selected_repos loaded repo_names in
+            let* () = validate_add_repos ~workspace ~workspace_root repos in
+            let rec loop acc = function
+              | [] -> Ok (List.rev acc)
+              | (repo : Types.repo) :: rest ->
+                  let* workspace_repo =
+                    create_workspace_repo ~loaded ~workspace_id:workspace.id ~workspace_root
+                      ~template ?base repo
+                  in
+                  created_repos := workspace_repo :: !created_repos;
+                  loop (workspace_repo :: acc) rest
+            in
+            let* added_repos = loop [] repos in
+            let updated_workspace =
+              { workspace with Types.repos = workspace.repos @ added_repos }
+            in
+            let code_workspace_path =
+              Filename.concat workspace_root (workspace.Types.id ^ ".code-workspace")
+            in
+            let* workspace_backup = Fs.read_file workspace_path in
+            let* code_workspace_backup = read_optional_file code_workspace_path in
+            backups :=
+              Some
+                [
+                  (workspace_path, Some workspace_backup);
+                  (code_workspace_path, code_workspace_backup);
+                ];
+            let* () = write_vscode_workspace workspace_root updated_workspace in
+            let* () = Config.save_workspace workspace_path updated_workspace in
+            Ok (workspace_path, updated_workspace)
+          in
+          match result with Ok _ as ok -> ok | Error message -> rollback_error message)
 
 let filter_workspace_repos (workspace : Types.workspace) repo_filters =
   if repo_filters = [] then Ok workspace.Types.repos

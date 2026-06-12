@@ -142,6 +142,24 @@ let load_workspace_for_cmd config_path workspace_id =
   let* workspace_path, workspace = Config.load_workspace ?id:workspace_id loaded in
   Ok (loaded, workspace_path, workspace)
 
+let cmd_ws_add config_path json base branch_template args =
+  let result =
+    match args with
+    | [] -> Error "workspace id is required"
+    | [ _ ] -> Error "repo name is required"
+    | id :: repo_names ->
+        let* loaded, workspace_path, workspace = load_workspace_for_cmd config_path (Some id) in
+        Workspace.add_repos ~loaded ~workspace_path ~workspace ?base ?branch_template repo_names
+  in
+  exit_of_result ~json
+    ~to_json:(fun (meta_path, workspace) ->
+      `Assoc
+        [ ("meta_path", `String meta_path); ("workspace", Types.workspace_to_yojson workspace) ])
+    ~to_human:(fun (meta_path, workspace) ->
+      Printf.printf "Updated workspace %s\nMetadata: %s\nRepos: %d\n" workspace.Types.id meta_path
+        (List.length workspace.repos))
+    result
+
 let cmd_ws_status config_path json repo_filters args =
   let result =
     let* workspace_id = parse_optional_workspace_arg args in
@@ -351,6 +369,20 @@ let ws_new_cmd =
     (Cmd.info "new" ~doc:"Create a feature workspace with Git worktrees")
     Term.(const cmd_ws_new $ config_opt $ json_flag $ title $ base $ branch_template $ args)
 
+let ws_add_cmd =
+  let base =
+    let doc = "Override base revision for added repos in this workspace." in
+    Arg.(value & opt (some string) None & info [ "base" ] ~docv:"REV" ~doc)
+  in
+  let branch_template =
+    let doc = "Override branch template for added repos. Variables: {user}, {workspace}, {repo}." in
+    Arg.(value & opt (some string) None & info [ "branch-template" ] ~docv:"TEMPLATE" ~doc)
+  in
+  let args = args_pos "WORKSPACE REPO..." "Workspace id followed by one or more repo names." in
+  Cmd.v
+    (Cmd.info "add" ~doc:"Add repositories to an existing feature workspace")
+    Term.(const cmd_ws_add $ config_opt $ json_flag $ base $ branch_template $ args)
+
 let ws_list_cmd =
   Cmd.v
     (Cmd.info "list" ~doc:"List local workspaces")
@@ -375,7 +407,7 @@ let ws_clean_cmd =
 let ws_cmd =
   Cmd.group
     (Cmd.info "ws" ~doc:"Manage feature workspaces")
-    [ ws_new_cmd; ws_list_cmd; ws_status_cmd; ws_clean_cmd ]
+    [ ws_new_cmd; ws_add_cmd; ws_list_cmd; ws_status_cmd; ws_clean_cmd ]
 
 let run_cmd =
   let args =
@@ -421,6 +453,7 @@ let cmd =
       `P "vc mww init ~/dev/company";
       `P "vc mww repo add frontend git@gitlab.example.com:team/frontend.git";
       `P "vc mww ws new FEAT-123-login frontend backend";
+      `P "vc mww ws add FEAT-123-login api";
       `P "vc mww ws status FEAT-123-login --json";
       `P "vc mww run FEAT-123-login -- pnpm test";
     ]
