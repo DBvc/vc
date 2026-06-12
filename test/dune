@@ -1,0 +1,8 @@
+(executable
+ (name mww_regression_tests)
+ (libraries unix yojson))
+
+(rule
+ (alias runtest)
+ (deps ../bin/main.exe mww_regression_tests.exe)
+ (action (run ./mww_regression_tests.exe ../bin/main.exe)))
