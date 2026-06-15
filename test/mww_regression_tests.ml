@@ -16,6 +16,22 @@ let assert_equal_string label expected actual =
     fail
       (Printf.sprintf "%s\nexpected:\n%s\nactual:\n%s" label expected actual)
 
+let string_contains haystack needle =
+  let haystack_len = String.length haystack in
+  let needle_len = String.length needle in
+  if needle_len = 0 then true
+  else
+    let rec loop index =
+      index + needle_len <= haystack_len
+      && (String.sub haystack index needle_len = needle || loop (index + 1))
+    in
+    loop 0
+
+let assert_contains label haystack needle =
+  if not (string_contains haystack needle) then
+    fail
+      (Printf.sprintf "%s\nexpected to find:\n%s\nin:\n%s" label needle haystack)
+
 let shell_quote value =
   if value = "" then "''"
   else
@@ -134,6 +150,11 @@ let string_field name json =
   | Some (`String value) -> value
   | _ -> fail ("missing string field: " ^ name)
 
+let bool_field name json =
+  match member name json with
+  | Some (`Bool value) -> value
+  | _ -> fail ("missing bool field: " ^ name)
+
 let list_field name json =
   match member name json with
   | Some (`List values) -> values
@@ -145,6 +166,13 @@ let workspace_repo workspace_json repo_name =
   |> function
   | Some repo -> repo
   | None -> fail ("repo not found in workspace metadata: " ^ repo_name)
+
+let response_data json =
+  match member "data" json with Some data -> data | None -> fail "missing response data"
+
+let string_list_field name json =
+  list_field name json
+  |> List.map (function `String value -> value | _ -> fail ("non-string value in " ^ name))
 
 let load_json path = Yojson.Safe.from_string (read_file path)
 
@@ -217,6 +245,73 @@ let test_ws_add_rollback_and_ai_context vc_path =
       assert_bool "failed ws add should remove worktree created in this batch"
         (not (Sys.file_exists (workspace_root / "extra"))))
 
+let test_ws_clean_dry_run_preserves_workspace vc_path =
+  with_temp_dir (fun root ->
+      let app_remote = create_repo root "app" in
+      let api_remote = create_repo root "api" in
+      let mww_root = root / "mww" in
+      init_mww_root vc_path mww_root;
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "repo"; "add"; "app"; app_remote ]);
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "repo"; "add"; "api"; api_remote ]);
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "ws"; "new"; "feat"; "app"; "api" ]);
+      let workspace_json = load_json (mww_root / "workspaces" / "feat" / ".mww-workspace.json") in
+      let app_worktree = string_field "worktree_path" (workspace_repo workspace_json "app") in
+      let api_worktree = string_field "worktree_path" (workspace_repo workspace_json "api") in
+      let workspace_root = Filename.dirname app_worktree in
+      let workspace_meta = workspace_root / ".mww-workspace.json" in
+      let ai_context = workspace_root / "AI_CONTEXT.md" in
+      let code_workspace = workspace_root / "feat.code-workspace" in
+      let metadata_before = read_file workspace_meta in
+      let ai_context_before = read_file ai_context in
+      let code_workspace_before = read_file code_workspace in
+      let assert_workspace_unchanged label =
+        assert_bool (label ^ ": app worktree should still exist") (Sys.file_exists app_worktree);
+        assert_bool (label ^ ": api worktree should still exist") (Sys.file_exists api_worktree);
+        assert_equal_string (label ^ ": metadata should not change") metadata_before
+          (read_file workspace_meta);
+        assert_equal_string (label ^ ": AI_CONTEXT.md should not change") ai_context_before
+          (read_file ai_context);
+        assert_equal_string (label ^ ": code workspace should not change") code_workspace_before
+          (read_file code_workspace)
+      in
+      let human =
+        vc vc_path ~cwd:mww_root [ "mww"; "ws"; "clean"; "--dry-run"; "feat" ]
+      in
+      assert_contains "human dry-run should identify itself" human.stdout "Dry run";
+      assert_contains "human dry-run should list app worktree" human.stdout app_worktree;
+      assert_contains "human dry-run should list api worktree" human.stdout api_worktree;
+      assert_contains "human dry-run should list workspace metadata" human.stdout workspace_meta;
+      assert_contains "human dry-run should list AI_CONTEXT.md" human.stdout ai_context;
+      assert_contains "human dry-run should list code workspace" human.stdout code_workspace;
+      assert_workspace_unchanged "human dry-run";
+      let json_completed =
+        vc vc_path ~cwd:mww_root [ "mww"; "ws"; "clean"; "--dry-run"; "--json"; "feat" ]
+      in
+      let data = Yojson.Safe.from_string json_completed.stdout |> response_data in
+      assert_bool "json dry-run should mark dry_run=true" (bool_field "dry_run" data);
+      assert_equal_string "json dry-run should include workspace id" "feat"
+        (string_field "workspace_id" data);
+      let repo_worktrees =
+        list_field "repos" data |> List.map (fun repo -> string_field "worktree_path" repo)
+      in
+      assert_bool "json dry-run should include app worktree"
+        (List.mem app_worktree repo_worktrees);
+      assert_bool "json dry-run should include api worktree"
+        (List.mem api_worktree repo_worktrees);
+      let workspace_files = string_list_field "workspace_files" data in
+      assert_bool "json dry-run should include workspace metadata"
+        (List.mem workspace_meta workspace_files);
+      assert_bool "json dry-run should include AI_CONTEXT.md" (List.mem ai_context workspace_files);
+      assert_bool "json dry-run should include code workspace"
+        (List.mem code_workspace workspace_files);
+      assert_workspace_unchanged "json dry-run";
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "ws"; "clean"; "feat" ]);
+      assert_bool "clean should remove app worktree" (not (Sys.file_exists app_worktree));
+      assert_bool "clean should remove api worktree" (not (Sys.file_exists api_worktree));
+      assert_bool "clean should remove workspace metadata" (not (Sys.file_exists workspace_meta));
+      assert_bool "clean should remove AI_CONTEXT.md" (not (Sys.file_exists ai_context));
+      assert_bool "clean should remove code workspace" (not (Sys.file_exists code_workspace)))
+
 let run_test name f =
   try
     f ();
@@ -234,5 +329,7 @@ let () =
       run_test "master-only remote base fallback" (fun () ->
           test_master_only_remote_fallback vc_path);
       run_test "ws add rollback and AI_CONTEXT preservation" (fun () ->
-          test_ws_add_rollback_and_ai_context vc_path)
+          test_ws_add_rollback_and_ai_context vc_path);
+      run_test "ws clean dry-run preserves workspace" (fun () ->
+          test_ws_clean_dry_run_preserves_workspace vc_path)
   | _ -> fail "usage: mww_regression_tests <path-to-vc>"

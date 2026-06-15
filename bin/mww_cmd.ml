@@ -177,23 +177,75 @@ let cmd_ws_status config_path json repo_filters args =
     ~to_human:(fun (workspace, statuses) -> Render.print_status workspace statuses)
     result
 
-let cmd_ws_clean config_path json force args =
+let workspace_cleanup_files workspace_path (workspace : Types.workspace) =
+  let workspace_root = Filename.dirname workspace_path in
+  ( workspace_root,
+    [
+      workspace_path;
+      Filename.concat workspace_root "AI_CONTEXT.md";
+      Filename.concat workspace_root (workspace.Types.id ^ ".code-workspace");
+    ] )
+
+let clean_preview_to_yojson workspace_path (workspace : Types.workspace) ~force =
+  let workspace_root, workspace_files = workspace_cleanup_files workspace_path workspace in
+  `Assoc
+    [
+      ("dry_run", `Bool true);
+      ("force", `Bool force);
+      ("workspace_id", `String workspace.Types.id);
+      ("workspace_root", `String workspace_root);
+      ( "repos",
+        `List
+          (List.map
+             (fun (repo : Types.workspace_repo) ->
+               `Assoc
+                 [
+                   ("name", `String repo.Types.name);
+                   ("source_path", `String repo.source_path);
+                   ("worktree_path", `String repo.worktree_path);
+                 ])
+             workspace.repos) );
+      ("workspace_files", `List (List.map (fun path -> `String path) workspace_files));
+    ]
+
+let print_clean_preview workspace_path (workspace : Types.workspace) ~force =
+  let workspace_root, workspace_files = workspace_cleanup_files workspace_path workspace in
+  Printf.printf "Dry run: would remove workspace %s\n" workspace.Types.id;
+  Printf.printf "Force: %s\n" (if force then "yes" else "no");
+  Printf.printf "Workspace root: %s\n\n" workspace_root;
+  print_endline "Repo worktrees:";
+  List.iter
+    (fun (repo : Types.workspace_repo) ->
+      Printf.printf "- %s: %s\n" repo.Types.name repo.worktree_path)
+    workspace.repos;
+  print_endline "";
+  print_endline "Workspace files:";
+  List.iter (fun path -> Printf.printf "- %s\n" path) workspace_files
+
+let cmd_ws_clean config_path json force dry_run args =
   let result =
     let* id = parse_required_workspace_arg args in
     let* _loaded, workspace_path, workspace = load_workspace_for_cmd config_path (Some id) in
-    let* results = Workspace.clean ~workspace ~force () in
-    let workspace_root = Filename.dirname workspace_path in
-    let* () = Fs.remove_file_if_exists workspace_path in
-    let* () = Fs.remove_file_if_exists (Filename.concat workspace_root "AI_CONTEXT.md") in
-    let* () =
-      Fs.remove_file_if_exists
-        (Filename.concat workspace_root (workspace.Types.id ^ ".code-workspace"))
-    in
-    let* () = Fs.rmdir_if_empty workspace_root in
-    Ok results
+    if dry_run then Ok (`Preview (workspace_path, workspace))
+    else
+      let* results = Workspace.clean ~workspace ~force () in
+      let workspace_root, workspace_files = workspace_cleanup_files workspace_path workspace in
+      let rec remove_files = function
+        | [] -> Ok ()
+        | path :: rest ->
+            let* () = Fs.remove_file_if_exists path in
+            remove_files rest
+      in
+      let* () = remove_files workspace_files in
+      let* () = Fs.rmdir_if_empty workspace_root in
+      Ok (`Cleaned results)
   in
   match result with
-  | Ok results -> print_command_results ~json results
+  | Ok (`Preview (workspace_path, workspace)) ->
+      if json then Render.print_ok_json (clean_preview_to_yojson workspace_path workspace ~force)
+      else print_clean_preview workspace_path workspace ~force;
+      0
+  | Ok (`Cleaned results) -> print_command_results ~json results
   | Error message ->
       Render.print_error ~json message;
       1
@@ -399,10 +451,14 @@ let ws_clean_cmd =
     let doc = "Pass --force to git worktree remove." in
     Arg.(value & flag & info [ "f"; "force" ] ~doc)
   in
+  let dry_run =
+    let doc = "Preview repo worktrees and workspace files that would be removed." in
+    Arg.(value & flag & info [ "dry-run" ] ~doc)
+  in
   let args = args_pos "WORKSPACE" "Workspace id to remove." in
   Cmd.v
     (Cmd.info "clean" ~doc:"Remove worktrees and workspace metadata")
-    Term.(const cmd_ws_clean $ config_opt $ json_flag $ force $ args)
+    Term.(const cmd_ws_clean $ config_opt $ json_flag $ force $ dry_run $ args)
 
 let ws_cmd =
   Cmd.group
