@@ -7,9 +7,9 @@
 
 (package
  (name vc-cli)
- (synopsis "Developer command line tools")
+ (synopsis "Personal developer workflow console")
  (description
-  "vc collects small developer utilities and a multi-repo Git worktree workspace manager.")
+  "vc keeps local development workflows behind one short command while grouping capabilities by domain.")
  (maintainers "dbvcbetter@gmail.com")
  (authors "dbvcbetter@gmail.com")
  (license MIT)

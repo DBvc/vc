@@ -1,11 +1,14 @@
 # vc
 
-Developer command line tools.
+Personal developer workflow console.
 
-`vc` is an OCaml/Dune CLI. It currently provides:
+`vc` keeps local development workflows behind one short command while grouping capabilities by
+domain.
 
-- `vc md5 FILE`: print an MD5 digest for a file.
+## Command groups
+
 - `vc mww ...`: manage local multi-repo Git worktree workspaces.
+- `vc hash md5 FILE`: print an MD5 digest for a file.
 
 ## Build
 
@@ -13,6 +16,7 @@ Developer command line tools.
 opam install . --deps-only
 dune build
 dune exec ./bin/main.exe -- --help
+dune exec ./bin/main.exe -- hash md5 README.md
 ```
 
 ## Install
