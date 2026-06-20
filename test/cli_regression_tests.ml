@@ -183,6 +183,20 @@ let test_hash_help vc_path =
     "Print an MD5 digest for a file";
   assert_not_contains "hash help should not recommend legacy md5" completed.stdout "vc md5"
 
+let test_ai_help vc_path =
+  let completed = vc vc_path [ "ai"; "--help" ] in
+  assert_contains "ai help should describe the command group" completed.stdout "vc ai COMMAND";
+  assert_contains "ai help should document no built-in profiles" completed.stdout
+    "built-in model";
+  assert_contains "ai help should list list command" completed.stdout "list";
+  assert_contains "ai help should list sample config command" completed.stdout "sample-config";
+  assert_contains "ai help should list doctor command" completed.stdout "doctor";
+  assert_contains "ai help should list codex command" completed.stdout "codex";
+  assert_contains "ai help should list claude command" completed.stdout "claude";
+  assert_contains "ai help should show doctor example" completed.stdout "vc ai doctor";
+  assert_contains "ai help should show dry-run example" completed.stdout
+    "vc ai codex --dry-run main"
+
 let with_missing_config f =
   let path = Filename.temp_file "vc-cli-test-ai-missing-" ".json" in
   remove_if_exists path;
@@ -497,6 +511,7 @@ let () =
       run_test "legacy root md5 removal" (fun () -> test_legacy_root_md5_removed vc_path);
       run_test "root help" (fun () -> test_root_help vc_path);
       run_test "hash help" (fun () -> test_hash_help vc_path);
+      run_test "ai help" (fun () -> test_ai_help vc_path);
       run_test "ai has no built-in profiles" (fun () -> test_ai_no_builtin_profiles vc_path);
       run_test "ai sample config" (fun () -> test_ai_sample_config vc_path);
       run_test "ai configured dry-run" (fun () -> test_ai_configured_dry_run vc_path);
