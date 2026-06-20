@@ -41,19 +41,26 @@ comes from a local JSON config file.
 2. `$XDG_CONFIG_HOME/vc/ai_profiles.json`
 3. `~/.config/vc/ai_profiles.json`
 
-`vc ai` never creates or edits this file for you, and it never writes Codex
-config under `~/.codex`. If the selected path does not exist, `vc ai list`
-reports that path and shows no profiles instead of falling through to the next
-path.
+`vc ai` writes this file only when you explicitly run `vc ai init-config`.
+Without that command it never creates or edits config for you, and it never
+writes Codex config under `~/.codex`. If the selected path does not exist,
+`vc ai list` reports that path and shows no profiles instead of falling through
+to the next path.
 
 ```sh
 vc ai list
 vc ai list --json
 vc ai sample-config
+vc ai init-config
 vc ai doctor
 vc ai codex --dry-run main "summarize this repository"
 vc ai claude --dry-run main "summarize this repository"
 ```
+
+`vc ai init-config` writes the same placeholder JSON printed by
+`vc ai sample-config` to the selected config path, creating parent directories
+if needed. It refuses to overwrite an existing file; use
+`vc ai init-config --force` when you intentionally want to replace that file.
 
 Config schema version `1` uses a top-level `profiles` array. Profile ids must
 be unique. Aliases are optional, but `vc ai run <name>` fails if an alias
@@ -109,9 +116,10 @@ exists, profile count, env references, redacted env output, unset env entries,
 and whether `codex` / `claude` are present in `PATH`. It does not verify API
 credentials, provider reachability, or whether a model actually exists.
 
-Out of scope for `vc ai`: built-in model catalogs, automatic config writes,
-`fzf` profile picking, non-interactive `exec` wrappers, `.ai-runs` artifacts,
-free-form argument passthrough, and real provider/API validation.
+Out of scope for `vc ai`: built-in model catalogs, implicit config writes
+outside `init-config`, `fzf` profile picking, non-interactive `exec` wrappers,
+`.ai-runs` artifacts, free-form argument passthrough, and real provider/API
+validation.
 
 ## mww
 

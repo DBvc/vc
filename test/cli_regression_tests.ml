@@ -78,7 +78,24 @@ let write_file path contents =
   let ch = open_out_bin path in
   Fun.protect ~finally:(fun () -> close_out_noerr ch) (fun () -> output_string ch contents)
 
+let file_mode path =
+  let stats = Unix.stat path in
+  stats.Unix.st_perm land 0o777
+
 let remove_if_exists path = try Sys.remove path with Sys_error _ -> ()
+
+let remove_dir_if_exists path = try Unix.rmdir path with Unix.Unix_error _ -> ()
+
+let with_temp_config_path f =
+  let seed = Filename.temp_file "vc-cli-test-ai-init-" "" in
+  remove_if_exists seed;
+  let dir = seed ^ ".d" in
+  let path = Filename.concat dir "ai_profiles.json" in
+  Fun.protect
+    ~finally:(fun () ->
+      remove_if_exists path;
+      remove_dir_if_exists dir)
+    (fun () -> f path)
 
 let run ?(env = []) ?(unset_env = []) args =
   let stdout_file = Filename.temp_file "vc-cli-test-stdout-" ".log" in
@@ -190,6 +207,7 @@ let test_ai_help vc_path =
     "built-in model";
   assert_contains "ai help should list list command" completed.stdout "list";
   assert_contains "ai help should list sample config command" completed.stdout "sample-config";
+  assert_contains "ai help should list init config command" completed.stdout "init-config";
   assert_contains "ai help should list doctor command" completed.stdout "doctor";
   assert_contains "ai help should list codex command" completed.stdout "codex";
   assert_contains "ai help should list claude command" completed.stdout "claude";
@@ -336,6 +354,38 @@ let test_ai_sample_config vc_path =
   assert_not_contains "sample config should not bake in glm" completed.stdout "glm";
   assert_not_contains "sample config should not bake in deepseek" completed.stdout "deepseek";
   assert_not_contains "sample config should not bake in kimi" completed.stdout "kimi"
+
+let test_ai_init_config vc_path =
+  with_temp_config_path (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path) ] in
+      let created = vc ~env vc_path [ "ai"; "init-config" ] in
+      assert_contains "init-config should report created path" created.stdout
+        ("Created AI profile config: " ^ config_path);
+      let content = read_file config_path in
+      assert_contains "init-config should write schema version" content "\"version\": 1";
+      assert_contains "init-config should write codex sample" content "\"tool\": \"codex\"";
+      assert_contains "init-config should write claude sample" content "\"tool\": \"claude\"";
+      assert_not_contains "init-config should not bake in glm" content "glm";
+      assert_equal_int "init-config should create private config file" 0o600
+        (file_mode config_path);
+      let listed = vc ~env vc_path [ "ai"; "list"; "--json" ] in
+      assert_contains "init-config output should be parseable" listed.stdout "\"id\": \"codex-main\"";
+      write_file config_path "sentinel\n";
+      Unix.chmod config_path 0o644;
+      let blocked = vc_expect_failure ~env vc_path [ "ai"; "init-config" ] in
+      assert_contains "init-config should refuse existing config" blocked.stderr
+        "config already exists";
+      assert_contains "init-config should suggest force" blocked.stderr
+        "vc ai init-config --force";
+      assert_equal_string "init-config should not overwrite existing file" "sentinel\n"
+        (read_file config_path);
+      let forced = vc ~env vc_path [ "ai"; "init-config"; "--force" ] in
+      assert_contains "init-config --force should report written path" forced.stdout
+        ("Wrote AI profile config: " ^ config_path);
+      assert_contains "init-config --force should replace existing file" (read_file config_path)
+        "\"profiles\"";
+      assert_equal_int "init-config --force should keep config file private" 0o600
+        (file_mode config_path))
 
 let test_ai_configured_dry_run vc_path =
   with_temp_file ai_config (fun config_path ->
@@ -514,6 +564,7 @@ let () =
       run_test "ai help" (fun () -> test_ai_help vc_path);
       run_test "ai has no built-in profiles" (fun () -> test_ai_no_builtin_profiles vc_path);
       run_test "ai sample config" (fun () -> test_ai_sample_config vc_path);
+      run_test "ai init config" (fun () -> test_ai_init_config vc_path);
       run_test "ai configured dry-run" (fun () -> test_ai_configured_dry_run vc_path);
       run_test "ai doctor" (fun () -> test_ai_doctor vc_path);
       run_test "ai invalid config failures" (fun () -> test_ai_invalid_config_failures vc_path);

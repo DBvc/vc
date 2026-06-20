@@ -552,14 +552,73 @@ let sample_profiles =
       };
   ]
 
-let cmd_sample_config () =
+let sample_config_json () =
   `Assoc
     [
       ("version", `Int 1);
       ("profiles", `List (List.map config_profile_to_yojson sample_profiles));
     ]
-  |> Yojson.Safe.pretty_to_string |> print_endline;
+  |> Yojson.Safe.pretty_to_string
+
+let cmd_sample_config () =
+  sample_config_json () |> print_endline;
   0
+
+let format_unix_error fn arg error =
+  Printf.sprintf "%s %s: %s" fn arg (Unix.error_message error)
+
+let rec mkdir_p dir =
+  if dir = "" || dir = "." then Ok ()
+  else if Sys.file_exists dir then
+    if Sys.is_directory dir then Ok () else Error (dir ^ " exists and is not a directory")
+  else
+    let parent = Filename.dirname dir in
+    let* () = if parent = dir then Ok () else mkdir_p parent in
+    try
+      Unix.mkdir dir 0o700;
+      Ok ()
+    with
+    | Unix.Unix_error (Unix.EEXIST, _, _) when Sys.file_exists dir && Sys.is_directory dir ->
+        Ok ()
+    | Unix.Unix_error (error, fn, arg) -> Error (format_unix_error fn arg error)
+    | Sys_error message -> Error message
+
+let write_file ~force path contents =
+  try
+    let flags =
+      [ Open_wronly; Open_binary; Open_creat; (if force then Open_trunc else Open_excl) ]
+    in
+    let ch = open_out_gen flags 0o600 path in
+    Fun.protect
+      ~finally:(fun () -> close_out_noerr ch)
+      (fun () -> output_string ch contents);
+    Unix.chmod path 0o600;
+    Ok ()
+  with
+  | Sys_error message -> Error message
+  | Unix.Unix_error (error, fn, arg) -> Error (format_unix_error fn arg error)
+
+let cmd_init_config force =
+  let path = config_path () in
+  if Sys.file_exists path && not force then (
+    Printf.eprintf
+      "vc ai: config already exists: %s\nUse `vc ai init-config --force` to overwrite.\n"
+      path;
+    1)
+  else
+    match mkdir_p (Filename.dirname path) with
+    | Error message ->
+        Printf.eprintf "vc ai: failed to create config directory for %s: %s\n" path message;
+        1
+    | Ok () -> (
+        match write_file ~force path (sample_config_json () ^ "\n") with
+        | Error message ->
+            Printf.eprintf "vc ai: failed to write config %s: %s\n" path message;
+            1
+        | Ok () ->
+            Printf.printf "%s AI profile config: %s\n" (if force then "Wrote" else "Created")
+              path;
+            0)
 
 let print_binary_status tool =
   let bin = tool_bin tool in
@@ -613,11 +672,19 @@ let json_flag =
   let doc = "Print JSON output." in
   Arg.(value & flag & info [ "json" ] ~doc)
 
+let force_flag =
+  let doc = "Overwrite an existing ai_profiles.json." in
+  Arg.(value & flag & info [ "force" ] ~doc)
+
 let list_cmd = Cmd.v (Cmd.info "list" ~doc:"List AI launcher profiles") Term.(const cmd_list $ json_flag)
 
 let sample_config_cmd =
   Cmd.v (Cmd.info "sample-config" ~doc:"Print a sample ai_profiles.json")
     Term.(const cmd_sample_config $ const ())
+
+let init_config_cmd =
+  Cmd.v (Cmd.info "init-config" ~doc:"Create a sample ai_profiles.json")
+    Term.(const cmd_init_config $ force_flag)
 
 let doctor_cmd = Cmd.v (Cmd.info "doctor" ~doc:"Diagnose AI launcher configuration") Term.(const cmd_doctor $ const ())
 
@@ -647,10 +714,11 @@ let cmd =
       `S Manpage.s_examples;
       `P "vc ai list";
       `P "vc ai sample-config";
+      `P "vc ai init-config";
       `P "vc ai doctor";
       `P "vc ai codex --dry-run main";
       `P "vc ai claude --dry-run main";
     ]
   in
   Cmd.group (Cmd.info "ai" ~version:"0.1.0" ~doc ~man)
-    [ list_cmd; sample_config_cmd; doctor_cmd; run_cmd; codex_cmd; claude_cmd ]
+    [ list_cmd; sample_config_cmd; init_config_cmd; doctor_cmd; run_cmd; codex_cmd; claude_cmd ]
