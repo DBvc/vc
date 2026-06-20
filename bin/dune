@@ -1,4 +1,4 @@
 (executable
  (name main)
  (public_name vc)
- (libraries cmdliner mww))
+ (libraries cmdliner mww vc_hash))
