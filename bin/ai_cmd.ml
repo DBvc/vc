@@ -30,6 +30,10 @@ type loaded_config = {
 
 let ( let* ) value f = match value with Ok x -> f x | Error _ as e -> e
 
+let with_context context = function
+  | Ok value -> Ok value
+  | Error message -> Error (context ^ ": " ^ message)
+
 let getenv_opt name = try Some (Sys.getenv name) with Not_found -> None
 
 let home_dir () = match getenv_opt "HOME" with Some home -> home | None -> "."
@@ -118,6 +122,17 @@ let tool_of_string = function
   | "claude" -> Ok Claude
   | value -> Error ("unknown tool: " ^ value ^ ", expected codex or claude")
 
+let ensure_tool_specific_fields context tool fields =
+  match tool with
+  | Codex ->
+      if assoc_opt "model" fields <> None then
+        Error (context ^ ": field model is not allowed for codex profiles; use codex_profile")
+      else Ok ()
+  | Claude ->
+      if assoc_opt "codex_profile" fields <> None then
+        Error (context ^ ": field codex_profile is not allowed for claude profiles; use model")
+      else Ok ()
+
 let parse_common fields =
   let* id = required_string "id" fields in
   let* title = optional_string "title" fields in
@@ -132,21 +147,22 @@ let profile_of_yojson index json =
   match json with
   | `Assoc fields ->
       let context = Printf.sprintf "profiles[%d]" index in
-      let* tool_value = required_string "tool" fields in
-      let* tool = tool_of_string (String.lowercase_ascii tool_value) in
+      let* tool_value = required_string "tool" fields |> with_context context in
+      let* tool = tool_of_string (String.lowercase_ascii tool_value) |> with_context context in
       let allowed =
         match tool with
         | Codex -> "codex_profile" :: common_fields
         | Claude -> "model" :: common_fields
       in
+      let* () = ensure_tool_specific_fields context tool fields in
       let* () = ensure_allowed_fields context allowed fields in
-      let* common = parse_common fields in
+      let* common = parse_common fields |> with_context context in
       (match tool with
       | Codex ->
-          let* codex_profile = required_string "codex_profile" fields in
+          let* codex_profile = required_string "codex_profile" fields |> with_context context in
           Ok (Codex_profile { common; codex_profile })
       | Claude ->
-          let* model = required_string "model" fields in
+          let* model = required_string "model" fields |> with_context context in
           Ok (Claude_profile { common; model }))
   | _ -> Error (Printf.sprintf "profiles[%d] must be an object" index)
 
@@ -251,6 +267,11 @@ let env_refs s =
   loop 0;
   List.sort_uniq String.compare !refs
 
+let profile_env_refs profile =
+  profile_env profile
+  |> List.concat_map (fun (_, value) -> env_refs value)
+  |> List.sort_uniq String.compare
+
 let expand_env s =
   let len = String.length s in
   let buf = Buffer.create len in
@@ -288,10 +309,7 @@ let expand_env s =
   loop 0
 
 let missing_env_vars profile =
-  profile_env profile
-  |> List.concat_map (fun (_, value) -> env_refs value)
-  |> List.sort_uniq String.compare
-  |> List.filter (fun name -> getenv_opt name = None)
+  profile_env_refs profile |> List.filter (fun name -> getenv_opt name = None)
 
 let contains_sub s sub =
   let len_s = String.length s in
@@ -543,6 +561,48 @@ let cmd_sample_config () =
   |> Yojson.Safe.pretty_to_string |> print_endline;
   0
 
+let print_binary_status tool =
+  let bin = tool_bin tool in
+  match which bin with
+  | Some path -> Printf.printf "binary %s: found %s\n" bin path
+  | None -> Printf.printf "binary %s: missing in PATH (warning)\n" bin
+
+let print_doctor_profile profile =
+  Printf.printf "profile %s (%s): %s\n" (profile_id profile)
+    (tool_to_string (profile_tool profile))
+    (profile_title profile);
+  (match profile_env profile with
+  | [] -> Printf.printf "  env: none\n"
+  | env ->
+      List.iter
+        (fun (key, value) ->
+          Printf.printf "  env %s=%s\n" key (redact key (expand_env value)))
+        env);
+  (match profile_env_refs profile with
+  | [] -> Printf.printf "  env refs: none\n"
+  | refs ->
+      List.iter
+        (fun name ->
+          match getenv_opt name with
+          | Some _ -> Printf.printf "  env ref %s: set\n" name
+          | None -> Printf.printf "  env ref %s: missing (warning)\n" name)
+        refs);
+  List.iter (fun key -> Printf.printf "  unset %s\n" key) (profile_unset_env profile)
+
+let cmd_doctor () =
+  match load_config () with
+  | Error e ->
+      Printf.eprintf "vc ai: %s\n" e;
+      1
+  | Ok loaded ->
+      Printf.printf "Config: %s\n" loaded.path;
+      Printf.printf "Config file: %s\n" (if loaded.exists then "found" else "missing");
+      Printf.printf "Profiles: %d\n" (List.length loaded.profiles);
+      print_binary_status Codex;
+      print_binary_status Claude;
+      List.iter print_doctor_profile loaded.profiles;
+      0
+
 let args_pos doc = Arg.(value & pos_all string [] & info [] ~docv:"ARGS" ~doc)
 
 let dry_run_flag =
@@ -558,6 +618,8 @@ let list_cmd = Cmd.v (Cmd.info "list" ~doc:"List AI launcher profiles") Term.(co
 let sample_config_cmd =
   Cmd.v (Cmd.info "sample-config" ~doc:"Print a sample ai_profiles.json")
     Term.(const cmd_sample_config $ const ())
+
+let doctor_cmd = Cmd.v (Cmd.info "doctor" ~doc:"Diagnose AI launcher configuration") Term.(const cmd_doctor $ const ())
 
 let run_cmd =
   Cmd.v (Cmd.info "run" ~doc:"Run a profile by id or alias")
@@ -585,9 +647,10 @@ let cmd =
       `S Manpage.s_examples;
       `P "vc ai list";
       `P "vc ai sample-config";
+      `P "vc ai doctor";
       `P "vc ai codex --dry-run main";
       `P "vc ai claude --dry-run main";
     ]
   in
   Cmd.group (Cmd.info "ai" ~version:"0.1.0" ~doc ~man)
-    [ list_cmd; sample_config_cmd; run_cmd; codex_cmd; claude_cmd ]
+    [ list_cmd; sample_config_cmd; doctor_cmd; run_cmd; codex_cmd; claude_cmd ]
