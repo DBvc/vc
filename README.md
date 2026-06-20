@@ -1,6 +1,6 @@
 # vc
 
-Personal developer workflow console.
+**Vita Curiosa**: a personal developer workflow console.
 
 `vc` keeps local development workflows behind one short command while grouping capabilities by
 domain.
