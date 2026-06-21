@@ -97,6 +97,23 @@ let with_temp_config_path f =
       remove_dir_if_exists dir)
     (fun () -> f path)
 
+let with_temp_dir f =
+  let seed = Filename.temp_file "vc-cli-test-dir-" "" in
+  remove_if_exists seed;
+  let dir = seed ^ ".d" in
+  Unix.mkdir dir 0o700;
+  Fun.protect ~finally:(fun () -> remove_dir_if_exists dir) (fun () -> f dir)
+
+let with_fake_fzf script f =
+  with_temp_dir (fun dir ->
+      let path = Filename.concat dir "fzf" in
+      Fun.protect
+        ~finally:(fun () -> remove_if_exists path)
+        (fun () ->
+          write_file path script;
+          Unix.chmod path 0o700;
+          f dir))
+
 let run ?(env = []) ?(unset_env = []) ?stdin args =
   let stdout_file = Filename.temp_file "vc-cli-test-stdout-" ".log" in
   let stderr_file = Filename.temp_file "vc-cli-test-stderr-" ".log" in
@@ -195,7 +212,7 @@ let test_root_help vc_path =
   let completed = vc vc_path [ "--help" ] in
   assert_contains "root help should describe the workflow console" completed.stdout
     "Personal developer workflow console.";
-  assert_contains "root help should expose ai domain" completed.stdout "ai COMMAND";
+  assert_contains "root help should expose ai domain" completed.stdout "ai [COMMAND]";
   assert_contains "root help should expose hash domain" completed.stdout "hash COMMAND";
   assert_contains "root help should keep mww domain" completed.stdout "mww COMMAND";
   assert_contains "root help should show canonical hash example" completed.stdout
@@ -215,7 +232,7 @@ let test_hash_help vc_path =
 
 let test_ai_help vc_path =
   let completed = vc vc_path [ "ai"; "--help" ] in
-  assert_contains "ai help should describe the command group" completed.stdout "vc ai COMMAND";
+  assert_contains "ai help should describe the command group" completed.stdout "vc ai [COMMAND]";
   assert_contains "ai help should document no built-in profiles" completed.stdout
     "built-in model";
   assert_contains "ai help should list list command" completed.stdout "list";
@@ -492,10 +509,111 @@ let test_ai_pick_builtin_failures vc_path =
         "unknown tool: bad";
       let invalid_picker =
         vc_expect_failure ~env ~stdin:"1\n" vc_path
-          [ "ai"; "pick"; "--picker"; "fzf"; "--dry-run" ]
+          [ "ai"; "pick"; "--picker"; "bad"; "--dry-run" ]
       in
       assert_contains "pick unsupported picker should fail clearly" invalid_picker.stderr
-        "unsupported picker: fzf")
+        "unsupported picker: bad")
+
+let test_ai_default_picker_requires_tty vc_path =
+  with_temp_file ai_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path); ("PATH", "/definitely-missing-vc-ai-test") ] in
+      let completed = vc_expect_failure ~env vc_path [ "ai" ] in
+      assert_equal_int "default ai picker should fail without a tty" 1 completed.exit_code;
+      assert_equal_string "default ai picker should not write stdout" "" completed.stdout;
+      assert_contains "default ai picker should explain tty requirement" completed.stderr
+        "interactive picker requires a terminal";
+      assert_not_contains "default ai picker should not start builtin prompt" completed.stderr
+        "Select AI profile:")
+
+let test_ai_pick_auto_falls_back_to_builtin vc_path =
+  with_temp_file ai_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path); ("PATH", "/definitely-missing-vc-ai-test") ] in
+      let picked = vc ~env ~stdin:"1\n" vc_path [ "ai"; "pick"; "--dry-run" ] in
+      assert_equal_string "auto fallback should not write stdout" "" picked.stdout;
+      assert_contains "auto fallback should use builtin prompt" picked.stderr
+        "Select AI profile:";
+      assert_contains "auto fallback should launch selected codex profile" picked.stderr
+        "vc ai: Codex Main";
+      assert_contains "auto fallback should render codex command" picked.stderr
+        "$ codex --profile codex-local")
+
+let fake_fzf_select_second =
+  {|#!/bin/sh
+i=0
+while IFS= read -r line; do
+  i=$((i + 1))
+  if [ "$i" = "2" ]; then
+    printf '%s\n' "$line"
+    exit 0
+  fi
+done
+exit 1
+|}
+
+let fake_fzf_cancel =
+  {|#!/bin/sh
+while IFS= read -r line; do
+  :
+done
+exit 130
+|}
+
+let fake_fzf_fail =
+  {|#!/bin/sh
+while IFS= read -r line; do
+  :
+done
+exit 2
+|}
+
+let test_ai_pick_fzf_and_auto vc_path =
+  with_temp_file ai_config (fun config_path ->
+      with_fake_fzf fake_fzf_select_second (fun path ->
+          let env = [ ("VC_AI_CONFIG", config_path); ("PATH", path) ] in
+          let auto = vc ~env vc_path [ "ai"; "pick"; "--dry-run" ] in
+          assert_equal_string "auto fzf should not write stdout" "" auto.stdout;
+          assert_contains "auto should use fake fzf selection" auto.stderr
+            "vc ai: Claude Main";
+          assert_contains "auto fzf should render claude command" auto.stderr
+            "$ claude --model claude-local";
+          assert_not_contains "auto fzf should not fall back to builtin when fzf exists"
+            auto.stderr "Select AI profile:";
+          let explicit = vc ~env vc_path [ "ai"; "pick"; "--picker"; "fzf"; "--dry-run" ] in
+          assert_contains "explicit fzf should use fake fzf selection" explicit.stderr
+            "vc ai: Claude Main";
+          assert_not_contains "explicit fzf should not use builtin prompt" explicit.stderr
+            "Select AI profile:"))
+
+let test_ai_pick_fzf_failures vc_path =
+  with_temp_file ai_config (fun config_path ->
+      let missing_env =
+        [ ("VC_AI_CONFIG", config_path); ("PATH", "/definitely-missing-vc-ai-test") ]
+      in
+      let missing =
+        vc_expect_failure ~env:missing_env vc_path
+          [ "ai"; "pick"; "--picker"; "fzf"; "--dry-run" ]
+      in
+      assert_equal_int "explicit fzf should use command-not-found exit" 127 missing.exit_code;
+      assert_contains "explicit fzf should report missing fzf" missing.stderr
+        "fzf picker requested but fzf was not found in PATH";
+      assert_not_contains "explicit fzf should not fall back to builtin" missing.stderr
+        "Select AI profile:";
+      with_fake_fzf fake_fzf_cancel (fun path ->
+          let env = [ ("VC_AI_CONFIG", config_path); ("PATH", path) ] in
+          let cancelled =
+            vc_expect_failure ~env vc_path [ "ai"; "pick"; "--picker"; "fzf"; "--dry-run" ]
+          in
+          assert_equal_int "fzf cancellation should exit 130" 130 cancelled.exit_code;
+          assert_contains "fzf cancellation should be reported" cancelled.stderr
+            "selection cancelled");
+      with_fake_fzf fake_fzf_fail (fun path ->
+          let env = [ ("VC_AI_CONFIG", config_path); ("PATH", path) ] in
+          let failed =
+            vc_expect_failure ~env vc_path [ "ai"; "pick"; "--picker"; "fzf"; "--dry-run" ]
+          in
+          assert_equal_int "fzf failure should exit 1" 1 failed.exit_code;
+          assert_contains "fzf failure should be reported" failed.stderr
+            "fzf failed with exit code 2"))
 
 let test_ai_doctor vc_path =
   with_temp_file ai_doctor_config (fun config_path ->
@@ -652,6 +770,12 @@ let () =
       run_test "ai configured dry-run" (fun () -> test_ai_configured_dry_run vc_path);
       run_test "ai pick builtin" (fun () -> test_ai_pick_builtin vc_path);
       run_test "ai pick builtin failures" (fun () -> test_ai_pick_builtin_failures vc_path);
+      run_test "ai default picker requires tty" (fun () ->
+          test_ai_default_picker_requires_tty vc_path);
+      run_test "ai pick auto falls back to builtin" (fun () ->
+          test_ai_pick_auto_falls_back_to_builtin vc_path);
+      run_test "ai pick fzf and auto" (fun () -> test_ai_pick_fzf_and_auto vc_path);
+      run_test "ai pick fzf failures" (fun () -> test_ai_pick_fzf_failures vc_path);
       run_test "ai doctor" (fun () -> test_ai_doctor vc_path);
       run_test "ai invalid config failures" (fun () -> test_ai_invalid_config_failures vc_path);
       run_test "ai ambiguous alias" (fun () -> test_ai_ambiguous_alias vc_path);

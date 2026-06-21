@@ -358,6 +358,9 @@ let which prog =
     in
     loop paths
 
+let format_unix_error fn arg error =
+  Printf.sprintf "%s %s: %s" fn arg (Unix.error_message error)
+
 let env_array profile =
   let table = Hashtbl.create 128 in
   Array.iter
@@ -428,8 +431,8 @@ let run_process ~dry_run profile args =
             let _, status = Unix.waitpid [] pid in
             wait_status_to_exit status
           with Unix.Unix_error (error, fn, arg) ->
-            Printf.eprintf "vc ai: failed to run %s: %s %s %s\n" bin fn arg
-              (Unix.error_message error);
+            Printf.eprintf "vc ai: failed to run %s: %s\n" bin
+              (format_unix_error fn arg error);
             1)
 
 let prompt_from_args args =
@@ -457,11 +460,13 @@ let launch ~dry_run ?tool args =
               1
           | Ok profile -> run_process ~dry_run profile (command_for_profile profile prompt)))
 
-type picker_mode = Builtin
+type picker_mode = Auto | Fzf | Builtin
 
 let picker_mode_of_string = function
+  | "auto" -> Ok Auto
+  | "fzf" -> Ok Fzf
   | "builtin" -> Ok Builtin
-  | value -> Error ("unsupported picker: " ^ value ^ ", expected builtin")
+  | value -> Error ("unsupported picker: " ^ value ^ ", expected auto, fzf, or builtin")
 
 let tool_filter_of_string = function
   | "" -> Ok None
@@ -487,6 +492,17 @@ let print_picker_item item =
   let preview = command_for_profile item.profile None |> List.map shell_quote |> String.concat " " in
   Printf.eprintf "%d. %-28s %s\n" item.index (profile_display_label item.profile) preview
 
+let sanitize_picker_field value =
+  String.map (function '\t' | '\n' | '\r' -> ' ' | c -> c) value
+
+let picker_item_preview item =
+  command_for_profile item.profile None |> List.map shell_quote |> String.concat " "
+
+let fzf_line item =
+  Printf.sprintf "%d\t%s\t%s\n" item.index
+    (sanitize_picker_field (profile_display_label item.profile))
+    (sanitize_picker_field (picker_item_preview item))
+
 let select_builtin items =
   match items with
   | [] -> Error (`Failure "no profiles available")
@@ -508,39 +524,161 @@ let select_builtin items =
               | None -> Error (`Failure ("selection out of range: " ^ value))
               | Some item -> Ok item.profile)))
 
-let cmd_pick ~dry_run picker_raw tool_raw =
+let close_fd_noerr fd = try Unix.close fd with Unix.Unix_error _ -> ()
+
+let read_all_fd fd =
+  let buffer = Buffer.create 256 in
+  let bytes = Bytes.create 4096 in
+  let rec loop () =
+    match Unix.read fd bytes 0 (Bytes.length bytes) with
+    | 0 -> Buffer.contents buffer
+    | count ->
+        Buffer.add_string buffer (Bytes.sub_string bytes 0 count);
+        loop ()
+    | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop ()
+  in
+  loop ()
+
+let write_all_fd fd value =
+  let len = String.length value in
+  let rec loop offset =
+    if offset >= len then Ok ()
+    else
+      match Unix.write_substring fd value offset (len - offset) with
+      | 0 -> Error "short write"
+      | count -> loop (offset + count)
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> loop offset
+      | exception Unix.Unix_error (Unix.EPIPE, _, _) -> Error "broken pipe"
+      | exception Unix.Unix_error (error, fn, arg) -> Error (format_unix_error fn arg error)
+  in
+  loop 0
+
+let rec waitpid_nointr pid =
+  try Unix.waitpid [] pid with Unix.Unix_error (Unix.EINTR, _, _) -> waitpid_nointr pid
+
+let first_nonempty_line value =
+  value |> String.split_on_char '\n' |> List.find_opt (fun line -> String.trim line <> "")
+
+let parse_fzf_selection items output =
+  match first_nonempty_line output with
+  | None -> Error (`Failure "fzf returned no selection")
+  | Some line ->
+      let raw_index =
+        match String.index_opt line '\t' with
+        | None -> line
+        | Some index -> String.sub line 0 index
+      in
+      (match int_of_string_opt (String.trim raw_index) with
+      | None -> Error (`Failure ("fzf returned an invalid selection: " ^ line))
+      | Some choice -> (
+          match List.find_opt (fun item -> item.index = choice) items with
+          | None -> Error (`Failure ("fzf selection out of range: " ^ raw_index))
+          | Some item -> Ok item.profile))
+
+let fzf_args = [| "fzf"; "--delimiter"; "\t"; "--with-nth"; "2,3"; "--prompt"; "vc ai> " |]
+
+let run_fzf_process exe input =
+  let stdin_r, stdin_w = Unix.pipe () in
+  let stdout_r, stdout_w = Unix.pipe () in
+  Unix.set_close_on_exec stdin_w;
+  Unix.set_close_on_exec stdout_r;
+  try
+    let pid = Unix.create_process_env exe fzf_args (Unix.environment ()) stdin_r stdout_w Unix.stderr in
+    close_fd_noerr stdin_r;
+    close_fd_noerr stdout_w;
+    let write_error =
+      match write_all_fd stdin_w input with Ok () -> None | Error e -> Some e
+    in
+    close_fd_noerr stdin_w;
+    let output =
+      Fun.protect ~finally:(fun () -> close_fd_noerr stdout_r) (fun () -> read_all_fd stdout_r)
+    in
+    let _, status = waitpid_nointr pid in
+    Ok (output, status, write_error)
+  with Unix.Unix_error (error, fn, arg) ->
+    close_fd_noerr stdin_r;
+    close_fd_noerr stdin_w;
+    close_fd_noerr stdout_r;
+    close_fd_noerr stdout_w;
+    Error (format_unix_error fn arg error)
+
+let select_fzf_with_exe exe items =
+  let input = items |> List.map fzf_line |> String.concat "" in
+  match run_fzf_process exe input with
+  | Error e -> Error (`Failure ("fzf failed: " ^ e))
+  | Ok (output, status, write_error) -> (
+      match status with
+      | Unix.WEXITED 0 -> (
+          match write_error with
+          | Some e -> Error (`Failure ("fzf input failed: " ^ e))
+          | None -> parse_fzf_selection items output)
+      | Unix.WEXITED (1 | 130) -> Error `Cancelled
+      | _ ->
+          let detail =
+            match write_error with None -> "" | Some e -> " (" ^ e ^ ")"
+          in
+          Error
+            (`Failure
+              (Printf.sprintf "fzf failed with exit code %d%s"
+                 (wait_status_to_exit status) detail)))
+
+let select_with_picker picker items =
+  match picker with
+  | Builtin -> select_builtin items
+  | Fzf -> (
+      match which "fzf" with
+      | None -> Error (`Missing "fzf picker requested but fzf was not found in PATH")
+      | Some exe -> select_fzf_with_exe exe items)
+  | Auto -> (
+      match which "fzf" with
+      | None -> select_builtin items
+      | Some exe -> select_fzf_with_exe exe items)
+
+let has_interactive_tty () = Unix.isatty Unix.stdin && Unix.isatty Unix.stderr
+
+let cmd_pick ~require_tty ~dry_run picker_raw tool_raw =
   match picker_mode_of_string picker_raw with
   | Error e ->
       Printf.eprintf "vc ai: %s\n" e;
       1
-  | Ok Builtin -> (
-      match tool_filter_of_string tool_raw with
-      | Error e ->
-          Printf.eprintf "vc ai: %s\n" e;
-          1
-      | Ok tool -> (
-          match load_config () with
-          | Error e ->
-              Printf.eprintf "vc ai: %s\n" e;
-              1
-          | Ok loaded ->
-              if loaded.profiles = [] then (
-                print_no_profiles loaded;
-                1)
-              else
-                let items = picker_items ?tool loaded.profiles in
-                if items = [] then (
-                  Printf.eprintf "vc ai: no profiles match selected tool\n";
+  | Ok picker ->
+      if require_tty && not (has_interactive_tty ()) then (
+        Printf.eprintf
+          "vc ai: interactive picker requires a terminal; use `vc ai pick` or a subcommand like \
+           `vc ai list`.\n";
+        1)
+      else (
+        match tool_filter_of_string tool_raw with
+        | Error e ->
+            Printf.eprintf "vc ai: %s\n" e;
+            1
+        | Ok tool -> (
+            match load_config () with
+            | Error e ->
+                Printf.eprintf "vc ai: %s\n" e;
+                1
+            | Ok loaded ->
+                if loaded.profiles = [] then (
+                  print_no_profiles loaded;
                   1)
                 else
-                  match select_builtin items with
-                  | Ok profile -> run_process ~dry_run profile (command_for_profile profile None)
-                  | Error `Cancelled ->
-                      Printf.eprintf "vc ai: selection cancelled\n";
-                      130
-                  | Error (`Failure e) ->
-                      Printf.eprintf "vc ai: %s\n" e;
-                      1))
+                  let items = picker_items ?tool loaded.profiles in
+                  if items = [] then (
+                    Printf.eprintf "vc ai: no profiles match selected tool\n";
+                    1)
+                  else
+                    match select_with_picker picker items with
+                    | Ok profile ->
+                        run_process ~dry_run profile (command_for_profile profile None)
+                    | Error (`Missing e) ->
+                        Printf.eprintf "vc ai: %s\n" e;
+                        127
+                    | Error `Cancelled ->
+                        Printf.eprintf "vc ai: selection cancelled\n";
+                        130
+                    | Error (`Failure e) ->
+                        Printf.eprintf "vc ai: %s\n" e;
+                        1))
 
 let target_label = function
   | Codex_profile p -> "codex_profile=" ^ p.codex_profile
@@ -653,9 +791,6 @@ let cmd_sample_config () =
   sample_config_json () |> print_endline;
   0
 
-let format_unix_error fn arg error =
-  Printf.sprintf "%s %s: %s" fn arg (Unix.error_message error)
-
 let rec mkdir_p dir =
   if dir = "" || dir = "." then Ok ()
   else if Sys.file_exists dir then
@@ -766,8 +901,8 @@ let force_flag =
   Arg.(value & flag & info [ "force" ] ~doc)
 
 let picker_arg =
-  let doc = "Select a picker implementation. Only builtin is available in this version." in
-  Arg.(value & opt string "builtin" & info [ "picker" ] ~docv:"PICKER" ~doc)
+  let doc = "Select a picker implementation: auto, fzf, or builtin." in
+  Arg.(value & opt string "auto" & info [ "picker" ] ~docv:"PICKER" ~doc)
 
 let tool_filter_arg =
   let doc = "Only show profiles for TOOL, either codex or claude." in
@@ -787,8 +922,13 @@ let doctor_cmd = Cmd.v (Cmd.info "doctor" ~doc:"Diagnose AI launcher configurati
 
 let pick_cmd =
   Cmd.v (Cmd.info "pick" ~doc:"Pick and run an AI profile")
-    Term.(const (fun dry_run picker tool -> cmd_pick ~dry_run picker tool) $ dry_run_flag
+    Term.(const (fun dry_run picker tool -> cmd_pick ~require_tty:false ~dry_run picker tool) $ dry_run_flag
           $ picker_arg $ tool_filter_arg)
+
+let default_term =
+  Term.(
+    const (fun dry_run picker tool -> cmd_pick ~require_tty:true ~dry_run picker tool)
+    $ dry_run_flag $ picker_arg $ tool_filter_arg)
 
 let run_cmd =
   Cmd.v (Cmd.info "run" ~doc:"Run a profile by id or alias")
@@ -818,12 +958,13 @@ let cmd =
       `P "vc ai sample-config";
       `P "vc ai init-config";
       `P "vc ai doctor";
+      `P "vc ai";
       `P "vc ai pick --picker builtin";
       `P "vc ai codex --dry-run main";
       `P "vc ai claude --dry-run main";
     ]
   in
-  Cmd.group (Cmd.info "ai" ~version:"0.1.0" ~doc ~man)
+  Cmd.group ~default:default_term (Cmd.info "ai" ~version:"0.1.0" ~doc ~man)
     [
       list_cmd;
       sample_config_cmd;
