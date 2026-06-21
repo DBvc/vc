@@ -61,6 +61,10 @@ let profile_aliases profile = (common profile).aliases
 let profile_env profile = (common profile).env
 let profile_unset_env profile = (common profile).unset_env
 
+let starts_with ~prefix value =
+  let prefix_len = String.length prefix in
+  String.length value >= prefix_len && String.sub value 0 prefix_len = prefix
+
 let assoc_opt key fields = List.assoc_opt key fields
 
 let allowed_field key allowed = List.exists (String.equal key) allowed
@@ -753,21 +757,21 @@ let sample_profiles =
       {
         common =
           {
-            id = "codex-main";
-            title = "Codex / Main";
-            aliases = [ "main" ];
+            id = "codex-your-model";
+            title = "Your Codex Model";
+            aliases = [ "codex" ];
             env = [];
             unset_env = [];
           };
-        codex_profile = "main";
+        codex_profile = "your-codex-profile";
       };
     Claude_profile
       {
         common =
           {
-            id = "claude-main";
-            title = "Claude Code / Main";
-            aliases = [ "main" ];
+            id = "claude-your-model";
+            title = "Your Claude Model";
+            aliases = [ "claude" ];
             env =
               [
                 ("ANTHROPIC_BASE_URL", "${YOUR_CLAUDE_BASE_URL}");
@@ -850,6 +854,155 @@ let print_binary_status tool =
   | Some path -> Printf.printf "binary %s: found %s\n" bin path
   | None -> Printf.printf "binary %s: missing in PATH (warning)\n" bin
 
+let read_file_opt path =
+  try
+    let ch = open_in_bin path in
+    Some
+      (Fun.protect
+         ~finally:(fun () -> close_in_noerr ch)
+         (fun () -> really_input_string ch (in_channel_length ch)))
+  with _ -> None
+
+let strip_surrounding_quotes value =
+  let value = String.trim value in
+  let len = String.length value in
+  if
+    len >= 2
+    && ((value.[0] = '"' && value.[len - 1] = '"')
+       || (value.[0] = '\'' && value.[len - 1] = '\''))
+  then String.sub value 1 (len - 2)
+  else value
+
+let toml_assignment_value key line =
+  let line = String.trim line in
+  if line = "" || starts_with ~prefix:"#" line || starts_with ~prefix:"[" line then None
+  else
+    match String.index_opt line '=' with
+    | None -> None
+    | Some index ->
+        let lhs = String.sub line 0 index |> String.trim in
+        if lhs <> key then None
+        else
+          let rhs = String.sub line (index + 1) (String.length line - index - 1) in
+          Some (strip_surrounding_quotes rhs)
+
+let toml_value key text =
+  text |> String.split_on_char '\n' |> List.find_map (toml_assignment_value key)
+
+let toml_has_assignment key value text =
+  match toml_value key text with Some found -> found = value | None -> false
+
+let toml_has_legacy_profile_selector text =
+  text |> String.split_on_char '\n'
+  |> List.exists (fun line ->
+         match toml_assignment_value "profile" line with Some _ -> true | None -> false)
+
+let toml_has_legacy_profiles_table text =
+  text |> String.split_on_char '\n'
+  |> List.exists (fun line ->
+         let line = String.trim line in
+         starts_with ~prefix:"[profiles." line)
+
+let toml_has_model_provider_section provider text =
+  let section = "[model_providers." ^ provider ^ "]" in
+  text |> String.split_on_char '\n'
+  |> List.exists (fun line -> String.trim line = section)
+
+let is_builtin_model_provider = function
+  | "openai" | "ollama" | "lmstudio" | "amazon-bedrock" -> true
+  | _ -> false
+
+let effective_env_var profile key =
+  match List.assoc_opt key (profile_env profile) with
+  | Some value -> Some (expand_env value)
+  | None ->
+      if List.exists (String.equal key) (profile_unset_env profile) then None else getenv_opt key
+
+let expand_home_path path =
+  if path = "~" then home_dir ()
+  else if starts_with ~prefix:"~/" path then
+    Filename.concat (home_dir ()) (String.sub path 2 (String.length path - 2))
+  else path
+
+let effective_codex_home profile =
+  match effective_env_var profile "CODEX_HOME" with
+  | Some "" | None -> Filename.concat (home_dir ()) ".codex"
+  | Some path -> expand_home_path path
+
+let resolve_path_from_codex_home codex_home path =
+  let path = expand_home_path path in
+  if Filename.is_relative path then Filename.concat codex_home path else path
+
+let print_file_status label path =
+  Printf.printf "  %s: %s %s\n" label
+    (if Sys.file_exists path then "found" else "missing")
+    path
+
+let print_codex_profile_doctor profile p =
+  let codex_home = effective_codex_home profile in
+  let main_config_path = Filename.concat codex_home "config.toml" in
+  let profile_config_path = Filename.concat codex_home (p.codex_profile ^ ".config.toml") in
+  let profile_sets_codex_home = List.assoc_opt "CODEX_HOME" (profile_env profile) <> None in
+  let launch_sets_codex_home = effective_env_var profile "CODEX_HOME" <> None in
+  Printf.printf "  codex home: %s\n" codex_home;
+  if profile_sets_codex_home then
+    Printf.printf
+      "  codex warning: this vc profile sets CODEX_HOME; that changes Codex config/state roots\n"
+  else if launch_sets_codex_home then
+    Printf.printf
+      "  codex warning: CODEX_HOME is set in the launch environment; bare Codex and vc ai may use \
+       different config/state roots\n";
+  print_file_status "codex main config" main_config_path;
+  print_file_status "codex profile file" profile_config_path;
+  let main_text = read_file_opt main_config_path in
+  let profile_text = read_file_opt profile_config_path in
+  Option.iter
+    (fun text ->
+      if toml_has_legacy_profile_selector text then
+        Printf.printf
+          "  codex warning: main config contains legacy profile = ... selector\n";
+      if toml_has_legacy_profiles_table text then
+        Printf.printf
+          "  codex warning: main config contains legacy [profiles.*] tables\n")
+    main_text;
+  match profile_text with
+  | None ->
+      Printf.printf
+        "  codex warning: codex --profile %s needs %s\n" p.codex_profile profile_config_path
+  | Some text ->
+      if toml_has_legacy_profiles_table text then
+        Printf.printf
+          "  codex warning: profile file contains legacy [profiles.*] tables\n";
+      if toml_has_assignment "forced_login_method" "api" text then
+        Printf.printf
+          "  codex warning: forced_login_method=api can conflict with ChatGPT web login\n";
+      let provider = toml_value "model_provider" text in
+      let catalog = toml_value "model_catalog_json" text in
+      Option.iter (fun value -> Printf.printf "  codex model_provider: %s\n" value) provider;
+      (match catalog with
+      | None -> ()
+      | Some path ->
+          let resolved = resolve_path_from_codex_home codex_home path in
+          Printf.printf "  codex model_catalog_json: %s %s\n"
+            (if Sys.file_exists resolved then "found" else "missing")
+            resolved);
+      (match provider with
+      | Some provider when not (is_builtin_model_provider provider) ->
+          let provider_defined =
+            List.exists
+              (fun text -> toml_has_model_provider_section provider text)
+              (List.filter_map Fun.id [ main_text; profile_text ])
+          in
+          if not provider_defined then
+            Printf.printf
+              "  codex warning: model_provider=%s but [model_providers.%s] was not found\n"
+              provider provider;
+          if catalog = None then
+            Printf.printf
+              "  codex warning: custom model_provider has no model_catalog_json; Codex may use \
+               fallback model metadata\n"
+      | _ -> ())
+
 let print_doctor_profile profile =
   Printf.printf "profile %s (%s): %s\n" (profile_id profile)
     (tool_to_string (profile_tool profile))
@@ -870,7 +1023,10 @@ let print_doctor_profile profile =
           | Some _ -> Printf.printf "  env ref %s: set\n" name
           | None -> Printf.printf "  env ref %s: missing (warning)\n" name)
         refs);
-  List.iter (fun key -> Printf.printf "  unset %s\n" key) (profile_unset_env profile)
+  List.iter (fun key -> Printf.printf "  unset %s\n" key) (profile_unset_env profile);
+  match profile with
+  | Codex_profile p -> print_codex_profile_doctor profile p
+  | Claude_profile _ -> ()
 
 let cmd_doctor () =
   match load_config () with

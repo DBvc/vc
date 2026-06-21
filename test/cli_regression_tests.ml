@@ -384,6 +384,10 @@ let test_ai_sample_config vc_path =
     "YOUR_CLAUDE_BASE_URL";
   assert_contains "sample config should use placeholder token" completed.stdout
     "YOUR_CLAUDE_API_TOKEN";
+  assert_contains "sample config should use model-first codex title" completed.stdout
+    "\"title\": \"Your Codex Model\"";
+  assert_contains "sample config should use model-first claude title" completed.stdout
+    "\"title\": \"Your Claude Model\"";
   assert_not_contains "sample config should not bake in glm" completed.stdout "glm";
   assert_not_contains "sample config should not bake in deepseek" completed.stdout "deepseek";
   assert_not_contains "sample config should not bake in kimi" completed.stdout "kimi"
@@ -402,7 +406,8 @@ let test_ai_init_config vc_path =
       assert_equal_int "init-config should create private config file" 0o600
         (file_mode config_path);
       let listed = vc ~env vc_path [ "ai"; "list"; "--json" ] in
-      assert_contains "init-config output should be parseable" listed.stdout "\"id\": \"codex-main\"";
+      assert_contains "init-config output should be parseable" listed.stdout
+        "\"id\": \"codex-your-model\"";
       write_file config_path "sentinel\n";
       Unix.chmod config_path 0o644;
       let blocked = vc_expect_failure ~env vc_path [ "ai"; "init-config" ] in
@@ -652,6 +657,93 @@ let test_ai_doctor vc_path =
       assert_contains "doctor should report unset env" completed.stdout
         "unset ANTHROPIC_API_KEY")
 
+let ai_doctor_codex_config codex_home =
+  Printf.sprintf
+    {|
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "codex-ark",
+      "title": "Ark GLM 5.2",
+      "aliases": ["codex-glm"],
+      "tool": "codex",
+      "codex_profile": "ark-glm-5-2",
+      "env": {
+        "CODEX_HOME": "%s",
+        "ARK_API_KEY": "${ARK_API_KEY}"
+      },
+      "unset_env": []
+    }
+  ]
+}
+|}
+    codex_home
+
+let test_ai_doctor_codex_profile_config vc_path =
+  with_temp_dir (fun dir ->
+      let codex_home = Filename.concat dir ".codex" in
+      Unix.mkdir codex_home 0o700;
+      let main_config = Filename.concat codex_home "config.toml" in
+      let profile_config = Filename.concat codex_home "ark-glm-5-2.config.toml" in
+      write_file main_config
+        {|
+profile = "legacy"
+
+[model_providers.volcengine-ark]
+name = "Volcengine Ark"
+base_url = "https://ark.example.test/v1"
+env_key = "ARK_API_KEY"
+wire_api = "responses"
+
+[profiles.legacy]
+model = "old"
+|};
+      write_file profile_config
+        {|
+model = "glm-5.2"
+model_provider = "volcengine-ark"
+forced_login_method = "api"
+|};
+      Fun.protect
+        ~finally:(fun () ->
+          remove_if_exists profile_config;
+          remove_if_exists main_config;
+          remove_dir_if_exists codex_home)
+        (fun () ->
+          with_temp_file (ai_doctor_codex_config codex_home) (fun config_path ->
+              let env =
+                [
+                  ("VC_AI_CONFIG", config_path);
+                  ("PATH", "/definitely-missing-vc-ai-test");
+                  ("ARK_API_KEY", "ark-secret");
+                ]
+              in
+              let completed = vc ~env vc_path [ "ai"; "doctor" ] in
+              assert_contains "doctor should report codex profile" completed.stdout
+                "profile codex-ark (codex): Ark GLM 5.2";
+              assert_contains "doctor should report codex home" completed.stdout
+                ("codex home: " ^ codex_home);
+              assert_contains "doctor should warn about CODEX_HOME" completed.stdout
+                "this vc profile sets CODEX_HOME";
+              assert_contains "doctor should find codex main config" completed.stdout
+                ("codex main config: found " ^ main_config);
+              assert_contains "doctor should find codex profile file" completed.stdout
+                ("codex profile file: found " ^ profile_config);
+              assert_contains "doctor should warn about legacy profile selector" completed.stdout
+                "legacy profile = ... selector";
+              assert_contains "doctor should warn about legacy profiles tables" completed.stdout
+                "legacy [profiles.*] tables";
+              assert_contains "doctor should report model provider" completed.stdout
+                "codex model_provider: volcengine-ark";
+              assert_not_contains "doctor should see provider definition" completed.stdout
+                "model_provider=volcengine-ark but [model_providers.volcengine-ark] was not found";
+              assert_contains "doctor should warn about forced api login" completed.stdout
+                "forced_login_method=api can conflict with ChatGPT web login";
+              assert_contains "doctor should warn about missing model catalog" completed.stdout
+                "custom model_provider has no model_catalog_json";
+              assert_not_contains "doctor should redact ark token" completed.stdout "ark-secret")))
+
 let test_ai_invalid_config_failures vc_path =
   let duplicate_id =
     config_with_profiles [ codex_profile_json "repeat"; claude_profile_json "repeat" ]
@@ -777,6 +869,8 @@ let () =
       run_test "ai pick fzf and auto" (fun () -> test_ai_pick_fzf_and_auto vc_path);
       run_test "ai pick fzf failures" (fun () -> test_ai_pick_fzf_failures vc_path);
       run_test "ai doctor" (fun () -> test_ai_doctor vc_path);
+      run_test "ai doctor codex profile config" (fun () ->
+          test_ai_doctor_codex_profile_config vc_path);
       run_test "ai invalid config failures" (fun () -> test_ai_invalid_config_failures vc_path);
       run_test "ai ambiguous alias" (fun () -> test_ai_ambiguous_alias vc_path);
       run_test "ai missing env blocks real run" (fun () -> test_ai_missing_env_blocks_real_run vc_path)
