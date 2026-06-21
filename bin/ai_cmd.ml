@@ -394,9 +394,6 @@ let command_for_profile profile prompt =
   | Codex_profile p -> [ "codex"; "--profile"; p.codex_profile ] @ prompt_arg prompt
   | Claude_profile p -> [ "claude"; "--model"; p.model ] @ prompt_arg prompt
 
-let profile_display_label profile =
-  Printf.sprintf "%s (%s)" (profile_title profile) (tool_display_name (profile_tool profile))
-
 let print_launch profile args =
   Printf.eprintf "vc ai: %s\n" (profile_title profile);
   List.iter
@@ -478,41 +475,139 @@ let tool_filter_of_string = function
       let* tool = tool_of_string (String.lowercase_ascii value) in
       Ok (Some tool)
 
+type color_mode = Color_auto | Color_always | Color_never
+
+let color_mode_of_string = function
+  | "auto" -> Ok Color_auto
+  | "always" -> Ok Color_always
+  | "never" -> Ok Color_never
+  | value -> Error ("unsupported color: " ^ value ^ ", expected auto, always, or never")
+
+let no_color_requested () = getenv_opt "NO_COLOR" <> None
+
+let term_is_dumb () = match getenv_opt "TERM" with Some "dumb" -> true | _ -> false
+
+let color_enabled fd = function
+  | Color_always -> true
+  | Color_never -> false
+  | Color_auto -> Unix.isatty fd && not (no_color_requested () || term_is_dumb ())
+
+let ansi code enabled value =
+  if enabled then "\027[" ^ code ^ "m" ^ value ^ "\027[0m" else value
+
+let style_dim enabled value = ansi "2" enabled value
+
+let style_tool enabled tool value =
+  match tool with Codex -> ansi "1;36" enabled value | Claude -> ansi "1;35" enabled value
+
+let strip_ansi value =
+  let len = String.length value in
+  let buffer = Buffer.create len in
+  let rec skip_csi index =
+    if index >= len then len
+    else
+      let c = value.[index] in
+      if c >= '@' && c <= '~' then index + 1 else skip_csi (index + 1)
+  in
+  let rec loop index =
+    if index >= len then Buffer.contents buffer
+    else if index + 1 < len && value.[index] = '\027' && value.[index + 1] = '[' then
+      loop (skip_csi (index + 2))
+    else (
+      Buffer.add_char buffer value.[index];
+      loop (index + 1))
+  in
+  loop 0
+
+type display_profile = {
+  display_id : string;
+  display_tool : tool;
+  display_title : string;
+  display_handle : string;
+  display_target : string;
+}
+
+let matching_profile_count profiles name =
+  List.fold_left
+    (fun count profile -> if profile_name_matches name profile then count + 1 else count)
+    0 profiles
+
+let profile_handle profiles profile =
+  let safe_alias alias = matching_profile_count profiles alias = 1 in
+  match List.find_opt safe_alias (profile_aliases profile) with
+  | Some alias -> alias
+  | None -> profile_id profile
+
+let profile_target = function
+  | Codex_profile p -> p.codex_profile
+  | Claude_profile p -> p.model
+
+let display_profile profiles profile =
+  {
+    display_id = profile_id profile;
+    display_tool = profile_tool profile;
+    display_title = profile_title profile;
+    display_handle = profile_handle profiles profile;
+    display_target = profile_target profile;
+  }
+
+let compare_display_profile left right =
+  let compare_field get =
+    String.compare (get left) (get right)
+  in
+  let title = compare_field (fun p -> p.display_title) in
+  if title <> 0 then title
+  else
+    let handle = compare_field (fun p -> p.display_handle) in
+    if handle <> 0 then handle else compare_field (fun p -> p.display_id)
+
+let display_profiles_for_tool tool profiles =
+  profiles
+  |> List.filter (fun profile -> profile_tool profile = tool)
+  |> List.map (display_profile profiles)
+  |> List.sort compare_display_profile
+
 type picker_item = {
   index : int;
   profile : profile;
+  display : display_profile;
 }
 
 let picker_items ?tool profiles =
-  profiles
-  |> List.filter (profile_matches_tool tool)
-  |> List.mapi (fun index profile -> { index = index + 1; profile })
+  let candidates = List.filter (profile_matches_tool tool) profiles in
+  candidates
+  |> List.mapi (fun index profile ->
+         { index = index + 1; profile; display = display_profile profiles profile })
 
 let print_no_profiles loaded =
   Printf.eprintf "No AI profiles configured.\nConfig: %s\n" loaded.path;
   if not loaded.exists then Printf.eprintf "Run `vc ai sample-config` to see the schema.\n"
 
-let print_picker_item item =
-  let preview = command_for_profile item.profile None |> List.map shell_quote |> String.concat " " in
-  Printf.eprintf "%d. %-28s %s\n" item.index (profile_display_label item.profile) preview
-
 let sanitize_picker_field value =
   String.map (function '\t' | '\n' | '\r' -> ' ' | c -> c) value
 
-let picker_item_preview item =
-  command_for_profile item.profile None |> List.map shell_quote |> String.concat " "
+let picker_visible_line color item =
+  let display = item.display in
+  String.concat "  "
+    [
+      sanitize_picker_field display.display_title;
+      style_tool color display.display_tool (tool_display_name display.display_tool);
+      style_dim color (sanitize_picker_field display.display_handle);
+      style_dim color (sanitize_picker_field display.display_target);
+    ]
 
-let fzf_line item =
-  Printf.sprintf "%d\t%s\t%s\n" item.index
-    (sanitize_picker_field (profile_display_label item.profile))
-    (sanitize_picker_field (picker_item_preview item))
+let print_picker_item color item =
+  Printf.eprintf "%d. %s\n" item.index (picker_visible_line color item)
 
-let select_builtin items =
+let fzf_line color item =
+  Printf.sprintf "%d\t%s\n" item.index (picker_visible_line color item)
+
+let select_builtin color items =
   match items with
   | [] -> Error (`Failure "no profiles available")
   | _ ->
       Printf.eprintf "Select AI profile:\n";
-      List.iter print_picker_item items;
+      List.iter (print_picker_item color) items;
       Printf.eprintf "Choice [1-%d]: %!" (List.length items);
       let raw =
         try Some (read_line () |> String.trim)
@@ -572,22 +667,29 @@ let parse_fzf_selection items output =
         | None -> line
         | Some index -> String.sub line 0 index
       in
-      (match int_of_string_opt (String.trim raw_index) with
+      let raw_index = strip_ansi raw_index |> String.trim in
+      (match int_of_string_opt raw_index with
       | None -> Error (`Failure ("fzf returned an invalid selection: " ^ line))
       | Some choice -> (
           match List.find_opt (fun item -> item.index = choice) items with
           | None -> Error (`Failure ("fzf selection out of range: " ^ raw_index))
           | Some item -> Ok item.profile))
 
-let fzf_args = [| "fzf"; "--delimiter"; "\t"; "--with-nth"; "2,3"; "--prompt"; "vc ai> " |]
+let fzf_args ~ansi =
+  ([ "fzf"; "--delimiter"; "\t"; "--with-nth"; "2"; "--prompt"; "vc ai> " ]
+  @ if ansi then [ "--ansi" ] else [])
+  |> Array.of_list
 
-let run_fzf_process exe input =
+let run_fzf_process exe ~ansi input =
   let stdin_r, stdin_w = Unix.pipe () in
   let stdout_r, stdout_w = Unix.pipe () in
   Unix.set_close_on_exec stdin_w;
   Unix.set_close_on_exec stdout_r;
   try
-    let pid = Unix.create_process_env exe fzf_args (Unix.environment ()) stdin_r stdout_w Unix.stderr in
+    let pid =
+      Unix.create_process_env exe (fzf_args ~ansi) (Unix.environment ()) stdin_r stdout_w
+        Unix.stderr
+    in
     close_fd_noerr stdin_r;
     close_fd_noerr stdout_w;
     let write_error =
@@ -606,9 +708,9 @@ let run_fzf_process exe input =
     close_fd_noerr stdout_w;
     Error (format_unix_error fn arg error)
 
-let select_fzf_with_exe exe items =
-  let input = items |> List.map fzf_line |> String.concat "" in
-  match run_fzf_process exe input with
+let select_fzf_with_exe color exe items =
+  let input = items |> List.map (fzf_line color) |> String.concat "" in
+  match run_fzf_process exe ~ansi:color input with
   | Error e -> Error (`Failure ("fzf failed: " ^ e))
   | Ok (output, status, write_error) -> (
       match status with
@@ -626,109 +728,69 @@ let select_fzf_with_exe exe items =
               (Printf.sprintf "fzf failed with exit code %d%s"
                  (wait_status_to_exit status) detail)))
 
-let select_with_picker picker items =
+let select_with_picker color picker items =
   match picker with
-  | Builtin -> select_builtin items
+  | Builtin -> select_builtin color items
   | Fzf -> (
       match which "fzf" with
       | None -> Error (`Missing "fzf picker requested but fzf was not found in PATH")
-      | Some exe -> select_fzf_with_exe exe items)
+      | Some exe -> select_fzf_with_exe color exe items)
   | Auto -> (
       match which "fzf" with
-      | None -> select_builtin items
-      | Some exe -> select_fzf_with_exe exe items)
+      | None -> select_builtin color items
+      | Some exe -> select_fzf_with_exe color exe items)
 
 let has_interactive_tty () = Unix.isatty Unix.stdin && Unix.isatty Unix.stderr
 
-let cmd_pick ~require_tty ~dry_run picker_raw tool_raw =
+let cmd_pick ~require_tty ~dry_run picker_raw color_raw tool_raw =
   match picker_mode_of_string picker_raw with
   | Error e ->
       Printf.eprintf "vc ai: %s\n" e;
       1
   | Ok picker ->
-      if require_tty && not (has_interactive_tty ()) then (
-        Printf.eprintf
-          "vc ai: interactive picker requires a terminal; use `vc ai pick` or a subcommand like \
-           `vc ai list`.\n";
-        1)
-      else (
-        match tool_filter_of_string tool_raw with
-        | Error e ->
-            Printf.eprintf "vc ai: %s\n" e;
-            1
-        | Ok tool -> (
-            match load_config () with
+      match color_mode_of_string color_raw with
+      | Error e ->
+          Printf.eprintf "vc ai: %s\n" e;
+          1
+      | Ok color_mode ->
+          if require_tty && not (has_interactive_tty ()) then (
+            Printf.eprintf
+              "vc ai: interactive picker requires a terminal; use `vc ai pick` or a subcommand \
+               like `vc ai list`.\n";
+            1)
+          else (
+            match tool_filter_of_string tool_raw with
             | Error e ->
                 Printf.eprintf "vc ai: %s\n" e;
                 1
-            | Ok loaded ->
-                if loaded.profiles = [] then (
-                  print_no_profiles loaded;
-                  1)
-                else
-                  let items = picker_items ?tool loaded.profiles in
-                  if items = [] then (
-                    Printf.eprintf "vc ai: no profiles match selected tool\n";
-                    1)
-                  else
-                    match select_with_picker picker items with
-                    | Ok profile ->
-                        run_process ~dry_run profile (command_for_profile profile None)
-                    | Error (`Missing e) ->
-                        Printf.eprintf "vc ai: %s\n" e;
-                        127
-                    | Error `Cancelled ->
-                        Printf.eprintf "vc ai: selection cancelled\n";
-                        130
-                    | Error (`Failure e) ->
-                        Printf.eprintf "vc ai: %s\n" e;
-                        1))
-
-type display_profile = {
-  display_id : string;
-  display_title : string;
-  display_handle : string;
-  display_target : string;
-}
-
-let matching_profile_count profiles name =
-  List.fold_left
-    (fun count profile -> if profile_name_matches name profile then count + 1 else count)
-    0 profiles
-
-let profile_handle profiles profile =
-  let safe_alias alias = matching_profile_count profiles alias = 1 in
-  match List.find_opt safe_alias (profile_aliases profile) with
-  | Some alias -> alias
-  | None -> profile_id profile
-
-let profile_target = function
-  | Codex_profile p -> p.codex_profile
-  | Claude_profile p -> p.model
-
-let display_profile profiles profile =
-  {
-    display_id = profile_id profile;
-    display_title = profile_title profile;
-    display_handle = profile_handle profiles profile;
-    display_target = profile_target profile;
-  }
-
-let compare_display_profile left right =
-  let compare_field get =
-    String.compare (get left) (get right)
-  in
-  let title = compare_field (fun p -> p.display_title) in
-  if title <> 0 then title
-  else
-    let handle = compare_field (fun p -> p.display_handle) in
-    if handle <> 0 then handle else compare_field (fun p -> p.display_id)
-
-let display_profiles_for_tool tool profiles =
-  profiles
-  |> List.filter (fun profile -> profile_tool profile = tool)
-  |> List.map (display_profile profiles)
-  |> List.sort compare_display_profile
+            | Ok tool -> (
+                match load_config () with
+                | Error e ->
+                    Printf.eprintf "vc ai: %s\n" e;
+                    1
+                | Ok loaded ->
+                    if loaded.profiles = [] then (
+                      print_no_profiles loaded;
+                      1)
+                    else
+                      let items = picker_items ?tool loaded.profiles in
+                      if items = [] then (
+                        Printf.eprintf "vc ai: no profiles match selected tool\n";
+                        1)
+                      else
+                        let color = color_enabled Unix.stderr color_mode in
+                        match select_with_picker color picker items with
+                        | Ok profile ->
+                            run_process ~dry_run profile (command_for_profile profile None)
+                        | Error (`Missing e) ->
+                            Printf.eprintf "vc ai: %s\n" e;
+                            127
+                        | Error `Cancelled ->
+                            Printf.eprintf "vc ai: selection cancelled\n";
+                            130
+                        | Error (`Failure e) ->
+                            Printf.eprintf "vc ai: %s\n" e;
+                            1))
 
 let max_string_width minimum values =
   List.fold_left (fun width value -> max width (String.length value)) minimum values
@@ -739,7 +801,7 @@ let pad_right width value =
 
 let target_header = function Codex -> "CODEX PROFILE" | Claude -> "MODEL ID"
 
-let print_display_group tool profiles =
+let print_display_group color tool profiles =
   let title_header = "TITLE" in
   let handle_header = "HANDLE" in
   let target_header = target_header tool in
@@ -753,18 +815,25 @@ let print_display_group tool profiles =
     |> List.map (fun profile -> profile.display_handle)
     |> max_string_width (String.length handle_header)
   in
-  let print_row title handle target =
+  let print_styled_row title handle target =
     Printf.printf "  %s  %s  %s\n" (pad_right title_width title)
-      (pad_right handle_width handle) target
+      (style_dim color (pad_right handle_width handle))
+      (style_dim color target)
   in
-  Printf.printf "%s\n" (tool_display_name tool);
-  print_row title_header handle_header target_header;
+  let print_header title handle target =
+    Printf.printf "  %s  %s  %s\n"
+      (style_dim color (pad_right title_width title))
+      (style_dim color (pad_right handle_width handle))
+      (style_dim color target)
+  in
+  Printf.printf "%s\n" (style_tool color tool (tool_display_name tool));
+  print_header title_header handle_header target_header;
   List.iter
     (fun profile ->
-      print_row profile.display_title profile.display_handle profile.display_target)
+      print_styled_row profile.display_title profile.display_handle profile.display_target)
     profiles
 
-let print_human_profile_list profiles =
+let print_human_profile_list color profiles =
   let groups =
     [ Codex; Claude ]
     |> List.map (fun tool -> (tool, display_profiles_for_tool tool profiles))
@@ -772,9 +841,9 @@ let print_human_profile_list profiles =
   in
   let rec loop = function
     | [] -> ()
-    | [ (tool, profiles) ] -> print_display_group tool profiles
+    | [ (tool, profiles) ] -> print_display_group color tool profiles
     | (tool, profiles) :: rest ->
-        print_display_group tool profiles;
+        print_display_group color tool profiles;
         print_newline ();
         loop rest
   in
@@ -799,23 +868,29 @@ let profile_to_yojson profile =
   in
   `Assoc (fields @ tool_fields)
 
-let cmd_list json =
-  match load_config () with
+let cmd_list json color_raw =
+  match color_mode_of_string color_raw with
   | Error e ->
       Printf.eprintf "vc ai: %s\n" e;
       1
-  | Ok loaded ->
-      if json then (
-        loaded.profiles |> List.map profile_to_yojson |> fun profiles ->
-        `List profiles |> Yojson.Safe.pretty_to_string |> print_endline;
-        0)
-      else if loaded.profiles = [] then (
-        Printf.printf "No AI profiles configured.\nConfig: %s\n" loaded.path;
-        if not loaded.exists then Printf.printf "Run `vc ai sample-config` to see the schema.\n";
-        0)
-      else (
-        print_human_profile_list loaded.profiles;
-        0)
+  | Ok color_mode -> (
+      match load_config () with
+      | Error e ->
+          Printf.eprintf "vc ai: %s\n" e;
+          1
+      | Ok loaded ->
+          if json then (
+            loaded.profiles |> List.map profile_to_yojson |> fun profiles ->
+            `List profiles |> Yojson.Safe.pretty_to_string |> print_endline;
+            0)
+          else if loaded.profiles = [] then (
+            Printf.printf "No AI profiles configured.\nConfig: %s\n" loaded.path;
+            if not loaded.exists then
+              Printf.printf "Run `vc ai sample-config` to see the schema.\n";
+            0)
+          else (
+            print_human_profile_list (color_enabled Unix.stdout color_mode) loaded.profiles;
+            0))
 
 let config_profile_to_yojson profile =
   let common = common profile in
@@ -1145,11 +1220,19 @@ let picker_arg =
   let doc = "Select a picker implementation: auto, fzf, or builtin." in
   Arg.(value & opt string "auto" & info [ "picker" ] ~docv:"PICKER" ~doc)
 
+let color_arg =
+  let doc =
+    "Color human output: auto, always, or never. Auto respects TTY, NO_COLOR, and TERM=dumb."
+  in
+  Arg.(value & opt string "auto" & info [ "color" ] ~docv:"WHEN" ~doc)
+
 let tool_filter_arg =
   let doc = "Only show profiles for TOOL, either codex or claude." in
   Arg.(value & opt string "" & info [ "tool" ] ~docv:"TOOL" ~doc)
 
-let list_cmd = Cmd.v (Cmd.info "list" ~doc:"List AI launcher profiles") Term.(const cmd_list $ json_flag)
+let list_cmd =
+  Cmd.v (Cmd.info "list" ~doc:"List AI launcher profiles")
+    Term.(const cmd_list $ json_flag $ color_arg)
 
 let sample_config_cmd =
   Cmd.v (Cmd.info "sample-config" ~doc:"Print a sample ai_profiles.json")
@@ -1163,13 +1246,15 @@ let doctor_cmd = Cmd.v (Cmd.info "doctor" ~doc:"Diagnose AI launcher configurati
 
 let pick_cmd =
   Cmd.v (Cmd.info "pick" ~doc:"Pick and run an AI profile")
-    Term.(const (fun dry_run picker tool -> cmd_pick ~require_tty:false ~dry_run picker tool) $ dry_run_flag
-          $ picker_arg $ tool_filter_arg)
+    Term.(
+      const (fun dry_run picker color tool ->
+          cmd_pick ~require_tty:false ~dry_run picker color tool)
+      $ dry_run_flag $ picker_arg $ color_arg $ tool_filter_arg)
 
 let default_term =
   Term.(
-    const (fun dry_run picker tool -> cmd_pick ~require_tty:true ~dry_run picker tool)
-    $ dry_run_flag $ picker_arg $ tool_filter_arg)
+    const (fun dry_run picker color tool -> cmd_pick ~require_tty:true ~dry_run picker color tool)
+    $ dry_run_flag $ picker_arg $ color_arg $ tool_filter_arg)
 
 let run_cmd =
   Cmd.v (Cmd.info "run" ~doc:"Run a profile by id or alias")

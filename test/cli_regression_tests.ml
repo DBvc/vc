@@ -60,6 +60,14 @@ let assert_before label haystack first second =
   | _, None ->
       fail (Printf.sprintf "%s\nmissing second text:\n%s\nin:\n%s" label second haystack)
 
+let assert_starts_with label value prefix =
+  match substring_index value prefix with
+  | Some 0 -> ()
+  | _ ->
+      fail
+        (Printf.sprintf "%s\nexpected value to start with:\n%s\nactual:\n%s" label prefix
+           value)
+
 let shell_quote value =
   if value = "" then "''"
   else
@@ -561,7 +569,32 @@ let test_ai_list_human_grouped_output vc_path =
       assert_contains "ai list should expose ambiguous codex alias fallback" human.stdout
         "Codex Main  codex-main  codex-local";
       assert_contains "ai list should expose ambiguous claude alias fallback" human.stdout
-        "Claude Main  claude-main  claude-local")
+        "Claude Main  claude-main  claude-local";
+      let auto = vc ~env vc_path [ "ai"; "list"; "--color"; "auto" ] in
+      assert_not_contains "ai list auto color should stay plain without tty" auto.stdout "\027[";
+      let never = vc ~env vc_path [ "ai"; "list"; "--color"; "never" ] in
+      assert_not_contains "ai list never color should stay plain" never.stdout "\027[";
+      let always = vc ~env vc_path [ "ai"; "list"; "--color"; "always" ] in
+      assert_contains "ai list always color should emit ansi" always.stdout "\027[";
+      assert_contains "ai list should color codex group" always.stdout "\027[1;36mCodex\027[0m";
+      let json = vc ~env vc_path [ "ai"; "list"; "--json"; "--color"; "always" ] in
+      assert_not_contains "ai list --json should never emit ansi" json.stdout "\027[";
+      assert_contains "ai list --json should keep JSON output with color option" json.stdout
+        "\"id\": \"codex-main\"";
+      let invalid_color =
+        vc_expect_failure ~env vc_path [ "ai"; "list"; "--color"; "bad" ]
+      in
+      assert_contains "ai list invalid color should fail clearly" invalid_color.stderr
+        "unsupported color: bad");
+  with_missing_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path) ] in
+      let invalid_color =
+        vc_expect_failure ~env vc_path [ "ai"; "list"; "--color"; "bad" ]
+      in
+      assert_contains "ai list invalid color should not depend on config" invalid_color.stderr
+        "unsupported color: bad";
+      assert_not_contains "ai list invalid color should not report missing config first"
+        invalid_color.stdout "No AI profiles configured.")
 
 let test_ai_pick_builtin vc_path =
   with_temp_file ai_config (fun config_path ->
@@ -571,9 +604,9 @@ let test_ai_pick_builtin vc_path =
       in
       assert_equal_string "pick builtin should not write stdout" "" picked.stdout;
       assert_contains "pick builtin should render codex option" picked.stderr
-        "1. Codex Main (Codex)";
+        "1. Codex Main  Codex  codex-main  codex-local";
       assert_contains "pick builtin should render claude option" picked.stderr
-        "2. Claude Main (Claude)";
+        "2. Claude Main  Claude  claude-main  claude-local";
       assert_contains "pick builtin should launch selected profile title" picked.stderr
         "vc ai: Claude Main";
       assert_contains "pick builtin should not pass a prompt" picked.stderr
@@ -585,11 +618,23 @@ let test_ai_pick_builtin vc_path =
           [ "ai"; "pick"; "--picker"; "builtin"; "--tool"; "codex"; "--dry-run" ]
       in
       assert_contains "pick builtin should filter codex profiles" codex_only.stderr
-        "1. Codex Main (Codex)";
+        "1. Codex Main  Codex  codex-main  codex-local";
       assert_not_contains "pick builtin should hide claude profiles with codex filter"
-        codex_only.stderr "Claude Main (Claude)";
+        codex_only.stderr "Claude Main  Claude";
       assert_contains "pick builtin codex filter should render codex command" codex_only.stderr
-        "$ codex --profile codex-local")
+        "$ codex --profile codex-local";
+      let colored =
+        vc ~env ~stdin:"1\n" vc_path
+          [ "ai"; "pick"; "--picker"; "builtin"; "--color"; "always"; "--dry-run" ]
+      in
+      assert_contains "pick builtin always color should emit ansi" colored.stderr "\027[";
+      assert_contains "pick builtin always color should still launch profile" colored.stderr
+        "vc ai: Codex Main";
+      let plain =
+        vc ~env ~stdin:"1\n" vc_path
+          [ "ai"; "pick"; "--picker"; "builtin"; "--color"; "never"; "--dry-run" ]
+      in
+      assert_not_contains "pick builtin never color should stay plain" plain.stderr "\027[")
 
 let test_ai_pick_builtin_failures vc_path =
   with_missing_config (fun config_path ->
@@ -629,7 +674,13 @@ let test_ai_pick_builtin_failures vc_path =
           [ "ai"; "pick"; "--picker"; "bad"; "--dry-run" ]
       in
       assert_contains "pick unsupported picker should fail clearly" invalid_picker.stderr
-        "unsupported picker: bad")
+        "unsupported picker: bad";
+      let invalid_color =
+        vc_expect_failure ~env ~stdin:"1\n" vc_path
+          [ "ai"; "pick"; "--color"; "bad"; "--dry-run" ]
+      in
+      assert_contains "pick unsupported color should fail clearly" invalid_color.stderr
+        "unsupported color: bad")
 
 let test_ai_default_picker_requires_tty vc_path =
   with_temp_file ai_config (fun config_path ->
@@ -683,6 +734,33 @@ done
 exit 2
 |}
 
+let fake_fzf_capture_first =
+  {|#!/bin/sh
+if [ -n "$VC_AI_FZF_ARGS" ]; then
+  for arg do
+    printf '%s\n' "$arg" >> "$VC_AI_FZF_ARGS"
+  done
+fi
+
+i=0
+selection=
+while IFS= read -r line; do
+  if [ -n "$VC_AI_FZF_INPUT" ]; then
+    printf '%s\n' "$line" >> "$VC_AI_FZF_INPUT"
+  fi
+  i=$((i + 1))
+  if [ "$i" = "1" ]; then
+    selection=$line
+  fi
+done
+
+if [ "$selection" = "" ]; then
+  exit 1
+fi
+
+printf '%s\n' "$selection"
+|}
+
 let test_ai_pick_fzf_and_auto vc_path =
   with_temp_file ai_config (fun config_path ->
       with_fake_fzf fake_fzf_select_second (fun path ->
@@ -699,7 +777,53 @@ let test_ai_pick_fzf_and_auto vc_path =
           assert_contains "explicit fzf should use fake fzf selection" explicit.stderr
             "vc ai: Claude Main";
           assert_not_contains "explicit fzf should not use builtin prompt" explicit.stderr
-            "Select AI profile:"))
+            "Select AI profile:");
+      with_fake_fzf fake_fzf_capture_first (fun path ->
+          with_temp_file "" (fun args_path ->
+              with_temp_file "" (fun input_path ->
+                  let env =
+                    [
+                      ("VC_AI_CONFIG", config_path);
+                      ("PATH", path);
+                      ("VC_AI_FZF_ARGS", args_path);
+                      ("VC_AI_FZF_INPUT", input_path);
+                    ]
+                  in
+                  let colored =
+                    vc ~env vc_path
+                      [ "ai"; "pick"; "--picker"; "fzf"; "--color"; "always"; "--dry-run" ]
+                  in
+                  assert_contains "colored fzf should launch selected profile" colored.stderr
+                    "vc ai: Codex Main";
+                  let args = read_file args_path in
+                  let input = read_file input_path in
+                  assert_contains "colored fzf should enable ansi mode" args "--ansi\n";
+                  assert_contains "colored fzf input should contain ansi" input "\027[";
+                  let first_line =
+                    match String.split_on_char '\n' input with line :: _ -> line | [] -> ""
+                  in
+                  assert_starts_with "fzf hidden index should stay plain" first_line "1\t")));
+      with_fake_fzf fake_fzf_capture_first (fun path ->
+          with_temp_file "" (fun args_path ->
+              with_temp_file "" (fun input_path ->
+                  let env =
+                    [
+                      ("VC_AI_CONFIG", config_path);
+                      ("PATH", path);
+                      ("VC_AI_FZF_ARGS", args_path);
+                      ("VC_AI_FZF_INPUT", input_path);
+                    ]
+                  in
+                  let plain =
+                    vc ~env vc_path
+                      [ "ai"; "pick"; "--picker"; "fzf"; "--color"; "never"; "--dry-run" ]
+                  in
+                  assert_contains "plain fzf should launch selected profile" plain.stderr
+                    "vc ai: Codex Main";
+                  let args = read_file args_path in
+                  let input = read_file input_path in
+                  assert_not_contains "plain fzf should not enable ansi mode" args "--ansi";
+                  assert_not_contains "plain fzf input should not contain ansi" input "\027["))))
 
 let test_ai_pick_fzf_failures vc_path =
   with_temp_file ai_config (fun config_path ->
