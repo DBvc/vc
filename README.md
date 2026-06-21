@@ -50,12 +50,14 @@ to the next path.
 ```sh
 vc ai list
 vc ai list --json
+vc ai list --color always
 vc ai sample-config
 vc ai init-config
 vc ai doctor
 vc ai
 vc ai pick
 vc ai pick --picker builtin
+vc ai pick --color never
 vc ai codex --dry-run main "summarize this repository"
 vc ai claude --dry-run main "summarize this repository"
 ```
@@ -158,11 +160,27 @@ you specifically want to force Codex API-key auth; it can conflict with the
 normal ChatGPT web login flow. If Codex starts but warns that model metadata is
 missing, add `model_catalog_json` to the Codex profile.
 
-`vc ai` is the interactive picker entry point. It shows configured profiles as
-`<title> (<Tool>)`, for example `glm-5.2 (Codex)` or `kimi-3.7 (Claude)`, then
-launches the selected profile with no prompt. The text before the parentheses is
-the profile title from your JSON config; you can use model-like titles for a
-model-first picker display without changing profile ids or aliases.
+`vc ai list` human output is meant for scanning, not scripting. It groups
+profiles by tool in `Codex` then `Claude` order, and sorts rows within each
+group by title, then handle, then profile id. Each group shows:
+
+- `TITLE`: the profile title from your JSON config. Use model-like titles when
+  you want a model-first display.
+- `HANDLE`: a safe name accepted by `vc ai run` and by the matching
+  tool-specific command (`vc ai codex` for Codex rows, `vc ai claude` for
+  Claude rows). It is the first unambiguous alias when one exists; otherwise it
+  is the full profile id.
+- `CODEX PROFILE` or `MODEL ID`: the target passed to the selected tool.
+
+Use `vc ai list --json` for automation. JSON output keeps the machine-readable
+schema and config order, and never includes ANSI color, even with
+`--color always`.
+
+`vc ai` is the interactive picker entry point. It shows configured profiles in a
+compact title-first row: `TITLE  Tool  HANDLE  TARGET`, for example
+`Ark GLM 5.2  Codex  codex-glm  ark-glm-5-2`, then launches the selected
+profile with no prompt. Picker order follows the JSON config order, optionally
+filtered by `--tool codex|claude`.
 
 `vc ai pick` runs the same picker explicitly. Picker mode is controlled by
 `--picker auto|fzf|builtin`:
@@ -178,6 +196,13 @@ blocking on a hidden prompt. Use `vc ai pick --picker builtin` when a script
 needs to feed a selection over stdin. Picker commands do not accept a prompt for
 the selected model; use `vc ai run`, `vc ai codex`, or `vc ai claude` when you
 want to pass prompt text.
+
+Human-readable profile output accepts `--color auto|always|never` on
+`vc ai list`, `vc ai`, and `vc ai pick`. `auto` is the default and only enables
+color for suitable terminals; it respects `NO_COLOR` and `TERM=dumb`. `always`
+forces ANSI color for human output, while `never` disables it. The option only
+affects `vc` profile rows and prompts; it does not change launched tool output or
+`vc ai list --json`.
 
 `vc ai doctor` reports only local facts: selected config path, whether the file
 exists, profile count, env references, redacted env output, unset env entries,
