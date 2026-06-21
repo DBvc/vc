@@ -684,9 +684,101 @@ let cmd_pick ~require_tty ~dry_run picker_raw tool_raw =
                         Printf.eprintf "vc ai: %s\n" e;
                         1))
 
-let target_label = function
-  | Codex_profile p -> "codex_profile=" ^ p.codex_profile
-  | Claude_profile p -> "model=" ^ p.model
+type display_profile = {
+  display_id : string;
+  display_title : string;
+  display_handle : string;
+  display_target : string;
+}
+
+let matching_profile_count profiles name =
+  List.fold_left
+    (fun count profile -> if profile_name_matches name profile then count + 1 else count)
+    0 profiles
+
+let profile_handle profiles profile =
+  let safe_alias alias = matching_profile_count profiles alias = 1 in
+  match List.find_opt safe_alias (profile_aliases profile) with
+  | Some alias -> alias
+  | None -> profile_id profile
+
+let profile_target = function
+  | Codex_profile p -> p.codex_profile
+  | Claude_profile p -> p.model
+
+let display_profile profiles profile =
+  {
+    display_id = profile_id profile;
+    display_title = profile_title profile;
+    display_handle = profile_handle profiles profile;
+    display_target = profile_target profile;
+  }
+
+let compare_display_profile left right =
+  let compare_field get =
+    String.compare (get left) (get right)
+  in
+  let title = compare_field (fun p -> p.display_title) in
+  if title <> 0 then title
+  else
+    let handle = compare_field (fun p -> p.display_handle) in
+    if handle <> 0 then handle else compare_field (fun p -> p.display_id)
+
+let display_profiles_for_tool tool profiles =
+  profiles
+  |> List.filter (fun profile -> profile_tool profile = tool)
+  |> List.map (display_profile profiles)
+  |> List.sort compare_display_profile
+
+let max_string_width minimum values =
+  List.fold_left (fun width value -> max width (String.length value)) minimum values
+
+let pad_right width value =
+  let padding = width - String.length value in
+  if padding <= 0 then value else value ^ String.make padding ' '
+
+let target_header = function Codex -> "CODEX PROFILE" | Claude -> "MODEL ID"
+
+let print_display_group tool profiles =
+  let title_header = "TITLE" in
+  let handle_header = "HANDLE" in
+  let target_header = target_header tool in
+  let title_width =
+    profiles
+    |> List.map (fun profile -> profile.display_title)
+    |> max_string_width (String.length title_header)
+  in
+  let handle_width =
+    profiles
+    |> List.map (fun profile -> profile.display_handle)
+    |> max_string_width (String.length handle_header)
+  in
+  let print_row title handle target =
+    Printf.printf "  %s  %s  %s\n" (pad_right title_width title)
+      (pad_right handle_width handle) target
+  in
+  Printf.printf "%s\n" (tool_display_name tool);
+  print_row title_header handle_header target_header;
+  List.iter
+    (fun profile ->
+      print_row profile.display_title profile.display_handle profile.display_target)
+    profiles
+
+let print_human_profile_list profiles =
+  let groups =
+    [ Codex; Claude ]
+    |> List.map (fun tool -> (tool, display_profiles_for_tool tool profiles))
+    |> List.filter (fun (_, profiles) -> profiles <> [])
+  in
+  let rec loop = function
+    | [] -> ()
+    | [ (tool, profiles) ] -> print_display_group tool profiles
+    | (tool, profiles) :: rest ->
+        print_display_group tool profiles;
+        print_newline ();
+        loop rest
+  in
+  loop groups
 
 let profile_to_yojson profile =
   let common = common profile in
@@ -722,14 +814,7 @@ let cmd_list json =
         if not loaded.exists then Printf.printf "Run `vc ai sample-config` to see the schema.\n";
         0)
       else (
-        List.iter
-          (fun p ->
-            let aliases =
-              match profile_aliases p with [] -> "" | xs -> " aliases=" ^ String.concat "," xs
-            in
-            Printf.printf "%-18s %-6s %-28s %s%s\n" (profile_id p)
-              (tool_to_string (profile_tool p)) (target_label p) (profile_title p) aliases)
-          loaded.profiles;
+        print_human_profile_list loaded.profiles;
         0)
 
 let config_profile_to_yojson profile =

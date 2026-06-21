@@ -28,6 +28,18 @@ let string_contains haystack needle =
     in
     loop 0
 
+let substring_index haystack needle =
+  let haystack_len = String.length haystack in
+  let needle_len = String.length needle in
+  if needle_len = 0 then Some 0
+  else
+    let rec loop index =
+      if index + needle_len > haystack_len then None
+      else if String.sub haystack index needle_len = needle then Some index
+      else loop (index + 1)
+    in
+    loop 0
+
 let assert_contains label haystack needle =
   if not (string_contains haystack needle) then
     fail (Printf.sprintf "%s\nexpected to find:\n%s\nin:\n%s" label needle haystack)
@@ -35,6 +47,18 @@ let assert_contains label haystack needle =
 let assert_not_contains label haystack needle =
   if string_contains haystack needle then
     fail (Printf.sprintf "%s\nexpected not to find:\n%s\nin:\n%s" label needle haystack)
+
+let assert_before label haystack first second =
+  match (substring_index haystack first, substring_index haystack second) with
+  | Some first_index, Some second_index when first_index < second_index -> ()
+  | Some _, Some _ ->
+      fail
+        (Printf.sprintf "%s\nexpected this text first:\n%s\nbefore:\n%s\nin:\n%s" label
+           first second haystack)
+  | None, _ ->
+      fail (Printf.sprintf "%s\nmissing first text:\n%s\nin:\n%s" label first haystack)
+  | _, None ->
+      fail (Printf.sprintf "%s\nmissing second text:\n%s\nin:\n%s" label second haystack)
 
 let shell_quote value =
   if value = "" then "''"
@@ -280,6 +304,51 @@ let ai_config =
 }
 |}
 
+let ai_display_config =
+  {|
+{
+  "version": 1,
+  "profiles": [
+    {
+      "id": "claude-kimi-k2-7-code",
+      "title": "Ark Kimi K2.7 Code",
+      "aliases": ["claude-kimi"],
+      "tool": "claude",
+      "model": "kimi-k2.7-code",
+      "env": {},
+      "unset_env": []
+    },
+    {
+      "id": "codex-deepseek-v4-pro",
+      "title": "Ark DeepSeek V4 Pro",
+      "aliases": ["codex-deepseek"],
+      "tool": "codex",
+      "codex_profile": "ark-deepseek-v4-pro",
+      "env": {},
+      "unset_env": []
+    },
+    {
+      "id": "codex-glm-5-2",
+      "title": "Ark GLM 5.2",
+      "aliases": ["codex-glm"],
+      "tool": "codex",
+      "codex_profile": "ark-glm-5-2",
+      "env": {},
+      "unset_env": []
+    },
+    {
+      "id": "claude-glm-5-2",
+      "title": "Ark GLM 5.2",
+      "aliases": ["claude-glm"],
+      "tool": "claude",
+      "model": "glm-5.2",
+      "env": {},
+      "unset_env": []
+    }
+  ]
+}
+|}
+
 let ai_doctor_config =
   {|
 {
@@ -450,6 +519,49 @@ let test_ai_configured_dry_run vc_path =
       let run = vc ~env vc_path [ "ai"; "run"; "--dry-run"; "codex-main"; "hello" ] in
       assert_contains "run dry-run should resolve full profile id" run.stderr
         "$ codex --profile codex-local hello")
+
+let test_ai_list_human_grouped_output vc_path =
+  with_temp_file ai_display_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path) ] in
+      let human = vc ~env vc_path [ "ai"; "list" ] in
+      assert_equal_string "ai list human should not write stderr" "" human.stderr;
+      assert_contains "ai list should render codex group" human.stdout "Codex\n";
+      assert_contains "ai list should render claude group" human.stdout "Claude\n";
+      assert_contains "ai list should show codex target header" human.stdout "CODEX PROFILE";
+      assert_contains "ai list should show claude target header" human.stdout "MODEL ID";
+      assert_contains "ai list should show codex deepseek row" human.stdout
+        "Ark DeepSeek V4 Pro  codex-deepseek  ark-deepseek-v4-pro";
+      assert_contains "ai list should show codex glm row" human.stdout
+        "Ark GLM 5.2          codex-glm       ark-glm-5-2";
+      assert_contains "ai list should show claude glm row" human.stdout
+        "Ark GLM 5.2         claude-glm   glm-5.2";
+      assert_contains "ai list should show claude kimi row" human.stdout
+        "Ark Kimi K2.7 Code  claude-kimi  kimi-k2.7-code";
+      assert_before "ai list should group codex before claude" human.stdout "Codex\n" "Claude\n";
+      assert_before "ai list should sort codex rows by title" human.stdout
+        "Ark DeepSeek V4 Pro" "Ark GLM 5.2          codex-glm";
+      assert_before "ai list should sort claude rows by title" human.stdout
+        "Ark GLM 5.2         claude-glm" "Ark Kimi K2.7 Code";
+      assert_not_contains "ai list human should hide old codex target label" human.stdout
+        "codex_profile=";
+      assert_not_contains "ai list human should hide old claude target label" human.stdout
+        "model=";
+      assert_not_contains "ai list human should hide old aliases suffix" human.stdout
+        "aliases=";
+      let json = vc ~env vc_path [ "ai"; "list"; "--json" ] in
+      assert_before "ai list --json should keep config order 1" json.stdout
+        "\"id\": \"claude-kimi-k2-7-code\"" "\"id\": \"codex-deepseek-v4-pro\"";
+      assert_before "ai list --json should keep config order 2" json.stdout
+        "\"id\": \"codex-deepseek-v4-pro\"" "\"id\": \"codex-glm-5-2\"";
+      assert_before "ai list --json should keep config order 3" json.stdout
+        "\"id\": \"codex-glm-5-2\"" "\"id\": \"claude-glm-5-2\"");
+  with_temp_file ai_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path) ] in
+      let human = vc ~env vc_path [ "ai"; "list" ] in
+      assert_contains "ai list should expose ambiguous codex alias fallback" human.stdout
+        "Codex Main  codex-main  codex-local";
+      assert_contains "ai list should expose ambiguous claude alias fallback" human.stdout
+        "Claude Main  claude-main  claude-local")
 
 let test_ai_pick_builtin vc_path =
   with_temp_file ai_config (fun config_path ->
@@ -860,6 +972,8 @@ let () =
       run_test "ai sample config" (fun () -> test_ai_sample_config vc_path);
       run_test "ai init config" (fun () -> test_ai_init_config vc_path);
       run_test "ai configured dry-run" (fun () -> test_ai_configured_dry_run vc_path);
+      run_test "ai list human grouped output" (fun () ->
+          test_ai_list_human_grouped_output vc_path);
       run_test "ai pick builtin" (fun () -> test_ai_pick_builtin vc_path);
       run_test "ai pick builtin failures" (fun () -> test_ai_pick_builtin_failures vc_path);
       run_test "ai default picker requires tty" (fun () ->
