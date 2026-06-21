@@ -53,6 +53,9 @@ vc ai list --json
 vc ai sample-config
 vc ai init-config
 vc ai doctor
+vc ai
+vc ai pick
+vc ai pick --picker builtin
 vc ai codex --dry-run main "summarize this repository"
 vc ai claude --dry-run main "summarize this repository"
 ```
@@ -111,15 +114,35 @@ the resolved command without checking whether `codex` or `claude` exists and
 without starting a process. Values whose keys contain `key`, `token`, or
 `secret` are redacted in launch and doctor output.
 
+`vc ai` is the interactive picker entry point. It shows configured profiles as
+`<title> (<Tool>)`, for example `glm-5.2 (Codex)` or `kimi-3.7 (Claude)`, then
+launches the selected profile with no prompt. The text before the parentheses is
+the profile title from your JSON config; you can use model-like titles for a
+model-first picker display without changing profile ids or aliases.
+
+`vc ai pick` runs the same picker explicitly. Picker mode is controlled by
+`--picker auto|fzf|builtin`:
+
+- `auto` is the default. It uses `fzf` when an `fzf` executable is present in
+  `PATH`; otherwise it falls back to the builtin numbered picker.
+- `fzf` requires `fzf` to be installed. If `fzf` starts and is cancelled or
+  fails, `vc` reports that result instead of silently falling back.
+- `builtin` always uses the numbered prompt and reads one selection from stdin.
+
+Bare `vc ai` is interactive-only: in non-TTY contexts it exits instead of
+blocking on a hidden prompt. Use `vc ai pick --picker builtin` when a script
+needs to feed a selection over stdin. Picker commands do not accept a prompt for
+the selected model; use `vc ai run`, `vc ai codex`, or `vc ai claude` when you
+want to pass prompt text.
+
 `vc ai doctor` reports only local facts: selected config path, whether the file
 exists, profile count, env references, redacted env output, unset env entries,
 and whether `codex` / `claude` are present in `PATH`. It does not verify API
 credentials, provider reachability, or whether a model actually exists.
 
 Out of scope for `vc ai`: built-in model catalogs, implicit config writes
-outside `init-config`, `fzf` profile picking, non-interactive `exec` wrappers,
-`.ai-runs` artifacts, free-form argument passthrough, and real provider/API
-validation.
+outside `init-config`, non-interactive `exec` wrappers, `.ai-runs` artifacts,
+free-form argument passthrough, and real provider/API validation.
 
 ## mww
 
