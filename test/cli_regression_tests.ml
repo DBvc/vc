@@ -97,15 +97,27 @@ let with_temp_config_path f =
       remove_dir_if_exists dir)
     (fun () -> f path)
 
-let run ?(env = []) ?(unset_env = []) args =
+let run ?(env = []) ?(unset_env = []) ?stdin args =
   let stdout_file = Filename.temp_file "vc-cli-test-stdout-" ".log" in
   let stderr_file = Filename.temp_file "vc-cli-test-stderr-" ".log" in
+  let stdin_file =
+    match stdin with
+    | None -> None
+    | Some contents ->
+        let path = Filename.temp_file "vc-cli-test-stdin-" ".log" in
+        write_file path contents;
+        Some path
+  in
   let env_prefix = command_env_prefix env unset_env in
+  let stdin_redirect =
+    match stdin_file with None -> "" | Some path -> " < " ^ shell_quote path
+  in
   let command =
-    env_prefix ^ command_to_string args ^ " > " ^ shell_quote stdout_file ^ " 2> "
-    ^ shell_quote stderr_file
+    env_prefix ^ command_to_string args ^ stdin_redirect ^ " > " ^ shell_quote stdout_file
+    ^ " 2> " ^ shell_quote stderr_file
   in
   let cleanup () =
+    Option.iter remove_if_exists stdin_file;
     remove_if_exists stdout_file;
     remove_if_exists stderr_file
   in
@@ -115,16 +127,16 @@ let run ?(env = []) ?(unset_env = []) args =
       let stderr = try read_file stderr_file with Sys_error _ -> "" in
       { command; exit_code; stdout; stderr })
 
-let expect_success ?env ?unset_env args =
-  let completed = run ?env ?unset_env args in
+let expect_success ?env ?unset_env ?stdin args =
+  let completed = run ?env ?unset_env ?stdin args in
   if completed.exit_code <> 0 then
     fail
       (Printf.sprintf "command failed: %s\nstdout:\n%s\nstderr:\n%s" completed.command
          completed.stdout completed.stderr);
   completed
 
-let expect_failure ?env ?unset_env args =
-  let completed = run ?env ?unset_env args in
+let expect_failure ?env ?unset_env ?stdin args =
+  let completed = run ?env ?unset_env ?stdin args in
   if completed.exit_code = 0 then
     fail
       (Printf.sprintf "command unexpectedly succeeded: %s\nstdout:\n%s\nstderr:\n%s"
@@ -149,10 +161,11 @@ let is_lower_hex_digest value =
   in
   String.length value = 32 && loop 0
 
-let vc ?env ?unset_env vc_path args = expect_success ?env ?unset_env (vc_path :: args)
+let vc ?env ?unset_env ?stdin vc_path args =
+  expect_success ?env ?unset_env ?stdin (vc_path :: args)
 
-let vc_expect_failure ?env ?unset_env vc_path args =
-  expect_failure ?env ?unset_env (vc_path :: args)
+let vc_expect_failure ?env ?unset_env ?stdin vc_path args =
+  expect_failure ?env ?unset_env ?stdin (vc_path :: args)
 
 let test_canonical_hash vc_path =
   with_temp_file "hello from vc\n" (fun path ->
@@ -209,9 +222,12 @@ let test_ai_help vc_path =
   assert_contains "ai help should list sample config command" completed.stdout "sample-config";
   assert_contains "ai help should list init config command" completed.stdout "init-config";
   assert_contains "ai help should list doctor command" completed.stdout "doctor";
+  assert_contains "ai help should list pick command" completed.stdout "pick";
   assert_contains "ai help should list codex command" completed.stdout "codex";
   assert_contains "ai help should list claude command" completed.stdout "claude";
   assert_contains "ai help should show doctor example" completed.stdout "vc ai doctor";
+  assert_contains "ai help should show pick example" completed.stdout
+    "vc ai pick --picker builtin";
   assert_contains "ai help should show dry-run example" completed.stdout
     "vc ai codex --dry-run main"
 
@@ -413,6 +429,74 @@ let test_ai_configured_dry_run vc_path =
       assert_contains "run dry-run should resolve full profile id" run.stderr
         "$ codex --profile codex-local hello")
 
+let test_ai_pick_builtin vc_path =
+  with_temp_file ai_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path); ("PATH", "/definitely-missing-vc-ai-test") ] in
+      let picked =
+        vc ~env ~stdin:"2\n" vc_path [ "ai"; "pick"; "--picker"; "builtin"; "--dry-run" ]
+      in
+      assert_equal_string "pick builtin should not write stdout" "" picked.stdout;
+      assert_contains "pick builtin should render codex option" picked.stderr
+        "1. Codex Main (Codex)";
+      assert_contains "pick builtin should render claude option" picked.stderr
+        "2. Claude Main (Claude)";
+      assert_contains "pick builtin should launch selected profile title" picked.stderr
+        "vc ai: Claude Main";
+      assert_contains "pick builtin should not pass a prompt" picked.stderr
+        "$ claude --model claude-local";
+      assert_not_contains "pick builtin dry-run should not check PATH" picked.stderr
+        "executable not found";
+      let codex_only =
+        vc ~env ~stdin:"1\n" vc_path
+          [ "ai"; "pick"; "--picker"; "builtin"; "--tool"; "codex"; "--dry-run" ]
+      in
+      assert_contains "pick builtin should filter codex profiles" codex_only.stderr
+        "1. Codex Main (Codex)";
+      assert_not_contains "pick builtin should hide claude profiles with codex filter"
+        codex_only.stderr "Claude Main (Claude)";
+      assert_contains "pick builtin codex filter should render codex command" codex_only.stderr
+        "$ codex --profile codex-local")
+
+let test_ai_pick_builtin_failures vc_path =
+  with_missing_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path) ] in
+      let missing =
+        vc_expect_failure ~env ~stdin:"1\n" vc_path
+          [ "ai"; "pick"; "--picker"; "builtin"; "--dry-run" ]
+      in
+      assert_equal_int "pick missing config should exit 1" 1 missing.exit_code;
+      assert_contains "pick missing config should report no profiles" missing.stderr
+        "No AI profiles configured.";
+      assert_contains "pick missing config should report selected path" missing.stderr config_path);
+  with_temp_file ai_config (fun config_path ->
+      let env = [ ("VC_AI_CONFIG", config_path) ] in
+      let cancelled =
+        vc_expect_failure ~env ~stdin:"" vc_path
+          [ "ai"; "pick"; "--picker"; "builtin"; "--dry-run" ]
+      in
+      assert_equal_int "pick EOF should exit as cancellation" 130 cancelled.exit_code;
+      assert_contains "pick EOF should report cancellation" cancelled.stderr
+        "selection cancelled";
+      let out_of_range =
+        vc_expect_failure ~env ~stdin:"3\n" vc_path
+          [ "ai"; "pick"; "--picker"; "builtin"; "--dry-run" ]
+      in
+      assert_equal_int "pick out of range should exit 1" 1 out_of_range.exit_code;
+      assert_contains "pick out of range should report error" out_of_range.stderr
+        "selection out of range: 3";
+      let invalid_tool =
+        vc_expect_failure ~env ~stdin:"1\n" vc_path
+          [ "ai"; "pick"; "--picker"; "builtin"; "--tool"; "bad"; "--dry-run" ]
+      in
+      assert_contains "pick invalid tool should fail clearly" invalid_tool.stderr
+        "unknown tool: bad";
+      let invalid_picker =
+        vc_expect_failure ~env ~stdin:"1\n" vc_path
+          [ "ai"; "pick"; "--picker"; "fzf"; "--dry-run" ]
+      in
+      assert_contains "pick unsupported picker should fail clearly" invalid_picker.stderr
+        "unsupported picker: fzf")
+
 let test_ai_doctor vc_path =
   with_temp_file ai_doctor_config (fun config_path ->
       let env =
@@ -566,6 +650,8 @@ let () =
       run_test "ai sample config" (fun () -> test_ai_sample_config vc_path);
       run_test "ai init config" (fun () -> test_ai_init_config vc_path);
       run_test "ai configured dry-run" (fun () -> test_ai_configured_dry_run vc_path);
+      run_test "ai pick builtin" (fun () -> test_ai_pick_builtin vc_path);
+      run_test "ai pick builtin failures" (fun () -> test_ai_pick_builtin_failures vc_path);
       run_test "ai doctor" (fun () -> test_ai_doctor vc_path);
       run_test "ai invalid config failures" (fun () -> test_ai_invalid_config_failures vc_path);
       run_test "ai ambiguous alias" (fun () -> test_ai_ambiguous_alias vc_path);

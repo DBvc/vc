@@ -51,6 +51,7 @@ let config_path () =
 
 let tool_to_string = function Codex -> "codex" | Claude -> "claude"
 let tool_bin = tool_to_string
+let tool_display_name = function Codex -> "Codex" | Claude -> "Claude"
 
 let common = function Codex_profile p -> p.common | Claude_profile p -> p.common
 let profile_tool = function Codex_profile _ -> Codex | Claude_profile _ -> Claude
@@ -386,6 +387,9 @@ let command_for_profile profile prompt =
   | Codex_profile p -> [ "codex"; "--profile"; p.codex_profile ] @ prompt_arg prompt
   | Claude_profile p -> [ "claude"; "--model"; p.model ] @ prompt_arg prompt
 
+let profile_display_label profile =
+  Printf.sprintf "%s (%s)" (profile_title profile) (tool_display_name (profile_tool profile))
+
 let print_launch profile args =
   Printf.eprintf "vc ai: %s\n" (profile_title profile);
   List.iter
@@ -452,6 +456,91 @@ let launch ~dry_run ?tool args =
               Printf.eprintf "vc ai: %s\n" e;
               1
           | Ok profile -> run_process ~dry_run profile (command_for_profile profile prompt)))
+
+type picker_mode = Builtin
+
+let picker_mode_of_string = function
+  | "builtin" -> Ok Builtin
+  | value -> Error ("unsupported picker: " ^ value ^ ", expected builtin")
+
+let tool_filter_of_string = function
+  | "" -> Ok None
+  | value ->
+      let* tool = tool_of_string (String.lowercase_ascii value) in
+      Ok (Some tool)
+
+type picker_item = {
+  index : int;
+  profile : profile;
+}
+
+let picker_items ?tool profiles =
+  profiles
+  |> List.filter (profile_matches_tool tool)
+  |> List.mapi (fun index profile -> { index = index + 1; profile })
+
+let print_no_profiles loaded =
+  Printf.eprintf "No AI profiles configured.\nConfig: %s\n" loaded.path;
+  if not loaded.exists then Printf.eprintf "Run `vc ai sample-config` to see the schema.\n"
+
+let print_picker_item item =
+  let preview = command_for_profile item.profile None |> List.map shell_quote |> String.concat " " in
+  Printf.eprintf "%d. %-28s %s\n" item.index (profile_display_label item.profile) preview
+
+let select_builtin items =
+  match items with
+  | [] -> Error (`Failure "no profiles available")
+  | _ ->
+      Printf.eprintf "Select AI profile:\n";
+      List.iter print_picker_item items;
+      Printf.eprintf "Choice [1-%d]: %!" (List.length items);
+      let raw =
+        try Some (read_line () |> String.trim)
+        with End_of_file -> None
+      in
+      (match raw with
+      | None | Some "" -> Error `Cancelled
+      | Some value -> (
+          match int_of_string_opt value with
+          | None -> Error (`Failure ("invalid selection: " ^ value))
+          | Some choice -> (
+              match List.find_opt (fun item -> item.index = choice) items with
+              | None -> Error (`Failure ("selection out of range: " ^ value))
+              | Some item -> Ok item.profile)))
+
+let cmd_pick ~dry_run picker_raw tool_raw =
+  match picker_mode_of_string picker_raw with
+  | Error e ->
+      Printf.eprintf "vc ai: %s\n" e;
+      1
+  | Ok Builtin -> (
+      match tool_filter_of_string tool_raw with
+      | Error e ->
+          Printf.eprintf "vc ai: %s\n" e;
+          1
+      | Ok tool -> (
+          match load_config () with
+          | Error e ->
+              Printf.eprintf "vc ai: %s\n" e;
+              1
+          | Ok loaded ->
+              if loaded.profiles = [] then (
+                print_no_profiles loaded;
+                1)
+              else
+                let items = picker_items ?tool loaded.profiles in
+                if items = [] then (
+                  Printf.eprintf "vc ai: no profiles match selected tool\n";
+                  1)
+                else
+                  match select_builtin items with
+                  | Ok profile -> run_process ~dry_run profile (command_for_profile profile None)
+                  | Error `Cancelled ->
+                      Printf.eprintf "vc ai: selection cancelled\n";
+                      130
+                  | Error (`Failure e) ->
+                      Printf.eprintf "vc ai: %s\n" e;
+                      1))
 
 let target_label = function
   | Codex_profile p -> "codex_profile=" ^ p.codex_profile
@@ -676,6 +765,14 @@ let force_flag =
   let doc = "Overwrite an existing ai_profiles.json." in
   Arg.(value & flag & info [ "force" ] ~doc)
 
+let picker_arg =
+  let doc = "Select a picker implementation. Only builtin is available in this version." in
+  Arg.(value & opt string "builtin" & info [ "picker" ] ~docv:"PICKER" ~doc)
+
+let tool_filter_arg =
+  let doc = "Only show profiles for TOOL, either codex or claude." in
+  Arg.(value & opt string "" & info [ "tool" ] ~docv:"TOOL" ~doc)
+
 let list_cmd = Cmd.v (Cmd.info "list" ~doc:"List AI launcher profiles") Term.(const cmd_list $ json_flag)
 
 let sample_config_cmd =
@@ -687,6 +784,11 @@ let init_config_cmd =
     Term.(const cmd_init_config $ force_flag)
 
 let doctor_cmd = Cmd.v (Cmd.info "doctor" ~doc:"Diagnose AI launcher configuration") Term.(const cmd_doctor $ const ())
+
+let pick_cmd =
+  Cmd.v (Cmd.info "pick" ~doc:"Pick and run an AI profile")
+    Term.(const (fun dry_run picker tool -> cmd_pick ~dry_run picker tool) $ dry_run_flag
+          $ picker_arg $ tool_filter_arg)
 
 let run_cmd =
   Cmd.v (Cmd.info "run" ~doc:"Run a profile by id or alias")
@@ -716,9 +818,19 @@ let cmd =
       `P "vc ai sample-config";
       `P "vc ai init-config";
       `P "vc ai doctor";
+      `P "vc ai pick --picker builtin";
       `P "vc ai codex --dry-run main";
       `P "vc ai claude --dry-run main";
     ]
   in
   Cmd.group (Cmd.info "ai" ~version:"0.1.0" ~doc ~man)
-    [ list_cmd; sample_config_cmd; init_config_cmd; doctor_cmd; run_cmd; codex_cmd; claude_cmd ]
+    [
+      list_cmd;
+      sample_config_cmd;
+      init_config_cmd;
+      doctor_cmd;
+      pick_cmd;
+      run_cmd;
+      codex_cmd;
+      claude_cmd;
+    ]
