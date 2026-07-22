@@ -522,6 +522,50 @@ let test_mww_run_preserves_argv vc_path =
       in
       assert_stdout "explicit sh -c" "shell-ok\n" shell_run)
 
+let test_doctor_human_and_json_output vc_path =
+  with_temp_dir (fun root ->
+      let fake_glab = root / "fake-glab" in
+      write_file fake_glab "#!/bin/sh\nprintf 'fake glab diagnostic\\n' >&2\nexit 7\n";
+      Unix.chmod fake_glab 0o755;
+      let config_path = root / "mww.json" in
+      write_json config_path
+        (`Assoc [ ("gitlab", `Assoc [ ("mr_tool", `String fake_glab) ]) ]);
+      let human = vc vc_path [ "mww"; "doctor"; "--config"; config_path ] in
+      assert_contains "human doctor should name git" human.stdout "git";
+      assert_contains "human doctor should show success" human.stdout "ok";
+      assert_contains "human doctor should name configured tool" human.stdout fake_glab;
+      assert_contains "human doctor should show failure" human.stdout "failed";
+      assert_contains "human doctor should include diagnostics" human.stdout
+        "fake glab diagnostic";
+      let human_is_json =
+        try
+          ignore (Yojson.Safe.from_string human.stdout);
+          true
+        with Yojson.Json_error _ -> false
+      in
+      assert_bool "human doctor should not print raw JSON" (not human_is_json);
+      let json_completed =
+        vc vc_path [ "mww"; "doctor"; "--config"; config_path; "--json" ]
+      in
+      let response = Yojson.Safe.from_string json_completed.stdout in
+      assert_bool "optional tool failure should keep doctor successful" (bool_field "ok" response);
+      let tools =
+        match response_data response with
+        | `List values -> values
+        | _ -> fail "doctor JSON data should be a list"
+      in
+      let fake_tool =
+        match List.find_opt (fun tool -> string_field "name" tool = fake_glab) tools with
+        | Some tool -> tool
+        | None -> fail "configured tool missing from doctor JSON"
+      in
+      assert_bool "doctor JSON should preserve failed tool status"
+        (not (bool_field "ok" fake_tool));
+      assert_bool "doctor JSON should preserve exit code"
+        (member "exit_code" fake_tool = Some (`Int 7));
+      assert_contains "doctor JSON should preserve stderr" (string_field "stderr" fake_tool)
+        "fake glab diagnostic")
+
 let run_test name f =
   try
     f ();
@@ -548,5 +592,7 @@ let () =
           test_ws_clean_dry_run_preserves_workspace vc_path);
       run_test "ws clean retry after partial failure" (fun () ->
           test_ws_clean_retry_after_partial_failure vc_path);
-      run_test "mww run preserves argv" (fun () -> test_mww_run_preserves_argv vc_path)
+      run_test "mww run preserves argv" (fun () -> test_mww_run_preserves_argv vc_path);
+      run_test "doctor human and JSON output" (fun () ->
+          test_doctor_human_and_json_output vc_path)
   | _ -> fail "usage: mww_regression_tests <path-to-vc>"

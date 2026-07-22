@@ -315,6 +315,21 @@ let cmd_mr_create config_path json repo_filters target_override args =
       Render.print_error ~json message;
       1
 
+let print_doctor_detail label value =
+  let value = String.trim value in
+  if value <> "" then Printf.printf "  %s: %s\n" label value
+
+let print_doctor_tool name = function
+  | Ok completed ->
+      Printf.printf "%s: %s (exit=%d)\n" name
+        (if completed.Proc.exit_code = 0 then "ok" else "failed")
+        completed.exit_code;
+      print_doctor_detail "stdout" completed.stdout;
+      print_doctor_detail "stderr" completed.stderr
+  | Error message ->
+      Printf.printf "%s: failed\n" name;
+      print_doctor_detail "error" message
+
 let cmd_doctor config_path json =
   let git = Git.version () in
   let glab_tool =
@@ -340,6 +355,10 @@ let cmd_doctor config_path json =
         `Assoc [ ("name", `String name); ("ok", `Bool false); ("error", `String message) ]
   in
   let data = `List [ normalize "git" git; normalize glab_tool glab ] in
+  let print_human () =
+    print_doctor_tool "git" git;
+    print_doctor_tool glab_tool glab
+  in
   let git_error =
     match git with
     | Ok completed when completed.Proc.exit_code = 0 -> None
@@ -349,12 +368,12 @@ let cmd_doctor config_path json =
   in
   match git_error with
   | None ->
-      if json then Render.print_ok_json data else print_endline (Yojson.Safe.pretty_to_string data);
+      if json then Render.print_ok_json data else print_human ();
       0
   | Some message ->
       if json then Render.print_json (Render.json_response ~data ~error:message false)
       else (
-        print_endline (Yojson.Safe.pretty_to_string data);
+        print_human ();
         Render.print_error message);
       1
 
