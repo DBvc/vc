@@ -239,6 +239,76 @@ let test_ws_new_rejects_duplicate_repos vc_path =
       assert_bool "duplicate repo must not create worktree"
         (not (Sys.file_exists (workspace_root / "a"))))
 
+let test_workspace_id_stays_within_workspace_root vc_path =
+  with_temp_dir (fun root ->
+      let remote = create_repo root "a" in
+      let mww_root = root / "mww" in
+      init_mww_root vc_path mww_root;
+      ignore
+        (vc vc_path ~cwd:mww_root [ "mww"; "repo"; "add"; "--no-clone"; "a"; remote ]);
+      let workspaces_path = mww_root / "workspaces" in
+      Unix.rmdir workspaces_path;
+      write_file workspaces_path "mkdir trap\n";
+      let escaped_id = Filename.concat Filename.parent_dir_name "escaped" in
+      let absolute_id = root / "absolute-workspace" in
+      let nested_id = Filename.concat "nested" "workspace" in
+      List.iter
+        (fun id ->
+          let failed =
+            vc_expect_failure vc_path ~cwd:mww_root [ "mww"; "ws"; "new"; id; "a" ]
+          in
+          assert_contains ("invalid workspace id: " ^ id) failed.stderr "invalid workspace id")
+        [
+          escaped_id;
+          "";
+          Filename.current_dir_name;
+          Filename.parent_dir_name;
+          absolute_id;
+          nested_id;
+        ];
+      let failed_load =
+        vc_expect_failure vc_path ~cwd:mww_root [ "mww"; "ws"; "status"; escaped_id ]
+      in
+      assert_contains "invalid workspace id must not be loaded" failed_load.stderr
+        "invalid workspace id";
+      assert_equal_string "invalid workspace ids must not touch workspaces path" "mkdir trap\n"
+        (read_file workspaces_path);
+      assert_bool "invalid workspace ids must not clone source"
+        (not (Sys.file_exists (mww_root / "repos" / "a")));
+      assert_bool "invalid workspace ids must not create escaped workspace"
+        (not (Sys.file_exists (mww_root / "escaped")));
+      assert_bool "invalid workspace ids must not create absolute workspace"
+        (not (Sys.file_exists absolute_id));
+      Sys.remove workspaces_path;
+      mkdir workspaces_path;
+      assert_bool "invalid workspace ids must not create workspace directories"
+        (Array.length (Sys.readdir workspaces_path) = 0);
+      let safe_id = "FEAT-123_login.v2" in
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "ws"; "new"; safe_id; "a" ]);
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "ws"; "status"; safe_id ]);
+      let workspace_meta = workspaces_path / safe_id / ".mww-workspace.json" in
+      let workspace_json = load_json workspace_meta in
+      assert_equal_string "safe workspace id should create and load" safe_id
+        (string_field "id" workspace_json);
+      let worktree_path = string_field "worktree_path" (workspace_repo workspace_json "a") in
+      let sentinel_path = mww_root / "victim.code-workspace" in
+      let sentinel = "must survive rejected clean\n" in
+      write_file sentinel_path sentinel;
+      let malicious_id =
+        Filename.concat Filename.parent_dir_name
+          (Filename.concat Filename.parent_dir_name "victim")
+      in
+      workspace_json |> set_string_field "id" malicious_id |> write_json workspace_meta;
+      let failed_clean =
+        vc_expect_failure vc_path ~cwd:mww_root [ "mww"; "ws"; "clean"; safe_id ]
+      in
+      assert_contains "invalid metadata workspace id must reject clean" failed_clean.stderr
+        "invalid workspace id";
+      assert_bool "rejected clean must preserve worktree" (Sys.file_exists worktree_path);
+      assert_bool "rejected clean must preserve metadata" (Sys.file_exists workspace_meta);
+      assert_equal_string "rejected clean must preserve outside sentinel" sentinel
+        (read_file sentinel_path))
+
 let test_ws_add_rollback_and_ai_context vc_path =
   with_temp_dir (fun root ->
       let app_remote = create_repo root "app" in
@@ -470,6 +540,8 @@ let () =
           test_master_only_remote_fallback vc_path);
       run_test "ws new rejects duplicate repos" (fun () ->
           test_ws_new_rejects_duplicate_repos vc_path);
+      run_test "workspace id stays within workspace root" (fun () ->
+          test_workspace_id_stays_within_workspace_root vc_path);
       run_test "ws add rollback and AI_CONTEXT preservation" (fun () ->
           test_ws_add_rollback_and_ai_context vc_path);
       run_test "ws clean dry-run preserves workspace" (fun () ->

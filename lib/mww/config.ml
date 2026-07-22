@@ -43,6 +43,14 @@ let config_to_workspace_dir (loaded : loaded) =
 let config_to_repos_dir (loaded : loaded) =
   Filename.concat loaded.root_dir loaded.config.Types.repos_dir
 
+let validate_workspace_id id =
+  if
+    id = "" || id = Filename.current_dir_name || id = Filename.parent_dir_name
+    || not (Filename.is_relative id)
+    || Filename.basename id <> id
+  then Error ("invalid workspace id: " ^ id)
+  else Ok ()
+
 let repo_source_path (loaded : loaded) (repo : Types.repo) =
   match repo.Types.source_path with
   | Some path when Filename.is_relative path -> Filename.concat loaded.root_dir path
@@ -53,9 +61,14 @@ let workspace_root (loaded : loaded) id = Filename.concat (config_to_workspace_d
 let workspace_meta_path workspace_root = Filename.concat workspace_root workspace_filename
 let workspace_path (loaded : loaded) id = workspace_meta_path (workspace_root loaded id)
 let find_workspace_meta_up () = Fs.find_up ~filename:workspace_filename
-let load_workspace_by_path path = Json_util.parse_file path Types.workspace_of_yojson
+
+let load_workspace_by_path path =
+  let* workspace = Json_util.parse_file path Types.workspace_of_yojson in
+  let* () = validate_workspace_id workspace.Types.id in
+  Ok workspace
 
 let load_workspace ?id (loaded : loaded) =
+  let* () = match id with Some id -> validate_workspace_id id | None -> Ok () in
   let path =
     match id with
     | Some id -> workspace_path loaded id

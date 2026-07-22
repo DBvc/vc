@@ -205,6 +205,7 @@ let rollback_workspace_repos created_repos =
   match List.rev !errors with [] -> None | errors -> Some (String.concat "; " errors)
 
 let create ~(loaded : Config.loaded) ~id ?title ?base ?branch_template repo_names =
+  let* () = Config.validate_workspace_id id in
   let* () =
     match duplicate_name repo_names with
     | Some name -> Error ("duplicate repo: " ^ name)
