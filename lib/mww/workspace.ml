@@ -205,6 +205,11 @@ let rollback_workspace_repos created_repos =
   match List.rev !errors with [] -> None | errors -> Some (String.concat "; " errors)
 
 let create ~(loaded : Config.loaded) ~id ?title ?base ?branch_template repo_names =
+  let* () =
+    match duplicate_name repo_names with
+    | Some name -> Error ("duplicate repo: " ^ name)
+    | None -> Ok ()
+  in
   let workspace_root = Config.workspace_root loaded id in
   if Fs.path_exists workspace_root then Error (workspace_root ^ " already exists")
   else

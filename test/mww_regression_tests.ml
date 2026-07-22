@@ -213,6 +213,32 @@ let test_master_only_remote_fallback vc_path =
         (string_field "target_branch" app_repo);
       assert_bool "app worktree should exist" (Sys.file_exists (mww_root / "workspaces" / "feat" / "app")))
 
+let test_ws_new_rejects_duplicate_repos vc_path =
+  with_temp_dir (fun root ->
+      let remote = create_repo root "a" in
+      let mww_root = root / "mww" in
+      init_mww_root vc_path mww_root;
+      ignore
+        (vc vc_path ~cwd:mww_root [ "mww"; "repo"; "add"; "--no-clone"; "a"; remote ]);
+      let source_path = mww_root / "repos" / "a" in
+      let workspaces_path = mww_root / "workspaces" in
+      Unix.rmdir workspaces_path;
+      write_file workspaces_path "mkdir trap\n";
+      let workspace_root = mww_root / "workspaces" / "feat" in
+      let failed =
+        vc_expect_failure vc_path ~cwd:mww_root [ "mww"; "ws"; "new"; "feat"; "a"; "a" ]
+      in
+      assert_contains "duplicate repo error" failed.stderr "duplicate repo: a";
+      assert_bool "duplicate repo must not clone source" (not (Sys.file_exists source_path));
+      assert_equal_string "duplicate repo must not touch workspaces path" "mkdir trap\n"
+        (read_file workspaces_path);
+      assert_bool "duplicate repo must not create workspace root"
+        (not (Sys.file_exists workspace_root));
+      assert_bool "duplicate repo must not create metadata"
+        (not (Sys.file_exists (workspace_root / ".mww-workspace.json")));
+      assert_bool "duplicate repo must not create worktree"
+        (not (Sys.file_exists (workspace_root / "a"))))
+
 let test_ws_add_rollback_and_ai_context vc_path =
   with_temp_dir (fun root ->
       let app_remote = create_repo root "app" in
@@ -442,6 +468,8 @@ let () =
       in
       run_test "master-only remote base fallback" (fun () ->
           test_master_only_remote_fallback vc_path);
+      run_test "ws new rejects duplicate repos" (fun () ->
+          test_ws_new_rejects_duplicate_repos vc_path);
       run_test "ws add rollback and AI_CONTEXT preservation" (fun () ->
           test_ws_add_rollback_and_ai_context vc_path);
       run_test "ws clean dry-run preserves workspace" (fun () ->
