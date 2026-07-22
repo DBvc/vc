@@ -500,19 +500,35 @@ let clean ~(workspace : Types.workspace) ?(force = false) () =
   let rec loop acc = function
     | [] -> Ok (List.rev acc)
     | (repo : Types.workspace_repo) :: rest ->
-        let* completed =
-          Git.worktree_remove ~force ~repo_path:repo.Types.source_path ~dest:repo.worktree_path ()
-        in
-        let result =
-          {
-            Types.name = repo.name;
-            path = repo.worktree_path;
-            command = completed.Proc.command;
-            exit_code = completed.exit_code;
-            stdout = completed.stdout;
-            stderr = completed.stderr;
-          }
-        in
-        loop (result :: acc) rest
+        if not (Fs.path_exists repo.worktree_path) then
+          (* ponytail: missing directories are completed retries; add an explicit repair command if
+             stale Git worktree registry entries need reconciliation. *)
+          loop acc rest
+        else
+          match
+            Git.worktree_remove ~force ~repo_path:repo.Types.source_path ~dest:repo.worktree_path ()
+          with
+          | Error message ->
+              let removed =
+                acc |> List.rev
+                |> List.map (fun (result : Types.repo_command_result) -> result.Types.name)
+              in
+              if removed = [] then Error message
+              else
+                Error
+                  (Printf.sprintf "%s\nremoved before failure: %s" message
+                     (String.concat ", " removed))
+          | Ok completed ->
+              let result =
+                {
+                  Types.name = repo.name;
+                  path = repo.worktree_path;
+                  command = completed.Proc.command;
+                  exit_code = completed.exit_code;
+                  stdout = completed.stdout;
+                  stderr = completed.stderr;
+                }
+              in
+              loop (result :: acc) rest
   in
   loop [] workspace.Types.repos

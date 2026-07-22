@@ -312,6 +312,65 @@ let test_ws_clean_dry_run_preserves_workspace vc_path =
       assert_bool "clean should remove AI_CONTEXT.md" (not (Sys.file_exists ai_context));
       assert_bool "clean should remove code workspace" (not (Sys.file_exists code_workspace)))
 
+let test_ws_clean_retry_after_partial_failure vc_path =
+  with_temp_dir (fun root ->
+      let repo_names = [ "a"; "b"; "c" ] in
+      let remotes = List.map (fun name -> (name, create_repo root name)) repo_names in
+      let mww_root = root / "mww" in
+      init_mww_root vc_path mww_root;
+      List.iter
+        (fun (name, remote) ->
+          ignore (vc vc_path ~cwd:mww_root [ "mww"; "repo"; "add"; name; remote ]))
+        remotes;
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "ws"; "new"; "feat"; "a"; "b"; "c" ]);
+      let workspace_root = mww_root / "workspaces" / "feat" in
+      let workspace_meta = workspace_root / ".mww-workspace.json" in
+      let ai_context = workspace_root / "AI_CONTEXT.md" in
+      let code_workspace = workspace_root / "feat.code-workspace" in
+      let workspace_json = load_json workspace_meta in
+      let repos =
+        List.map
+          (fun name ->
+            let repo = workspace_repo workspace_json name in
+            ( name,
+              string_field "source_path" repo,
+              string_field "worktree_path" repo,
+              string_field "branch" repo ))
+          repo_names
+      in
+      let _, _, b_worktree, _ = List.find (fun (name, _, _, _) -> name = "b") repos in
+      write_file (b_worktree / "dirty.txt") "dirty\n";
+      let first_clean =
+        vc_expect_failure vc_path ~cwd:mww_root [ "mww"; "ws"; "clean"; "feat" ]
+      in
+      let _, _, a_worktree, _ = List.find (fun (name, _, _, _) -> name = "a") repos in
+      let _, _, c_worktree, _ = List.find (fun (name, _, _, _) -> name = "c") repos in
+      assert_bool "first clean should remove a" (not (Sys.file_exists a_worktree));
+      assert_bool "first clean should stop at dirty b" (Sys.file_exists b_worktree);
+      assert_bool "first clean should leave c untouched" (Sys.file_exists c_worktree);
+      assert_bool "failed clean should preserve metadata" (Sys.file_exists workspace_meta);
+      assert_bool "failed clean should preserve AI_CONTEXT.md" (Sys.file_exists ai_context);
+      assert_bool "failed clean should preserve code workspace" (Sys.file_exists code_workspace);
+      assert_contains "failed clean should list repos removed before failure" first_clean.stderr
+        "removed before failure: a";
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "ws"; "clean"; "--force"; "feat" ]);
+      List.iter
+        (fun (name, source_path, worktree_path, branch) ->
+          assert_bool (name ^ " worktree should be removed") (not (Sys.file_exists worktree_path));
+          ignore
+            (expect_success ~cwd:source_path
+               [ "git"; "show-ref"; "--verify"; "refs/heads/" ^ branch ]);
+          let worktrees =
+            expect_success ~cwd:source_path [ "git"; "worktree"; "list"; "--porcelain" ]
+          in
+          assert_bool (name ^ " worktree registry should be clean")
+            (not (string_contains worktrees.stdout worktree_path)))
+        repos;
+      assert_bool "successful retry should remove metadata" (not (Sys.file_exists workspace_meta));
+      assert_bool "successful retry should remove AI_CONTEXT.md" (not (Sys.file_exists ai_context));
+      assert_bool "successful retry should remove code workspace"
+        (not (Sys.file_exists code_workspace)))
+
 let run_test name f =
   try
     f ();
@@ -331,5 +390,7 @@ let () =
       run_test "ws add rollback and AI_CONTEXT preservation" (fun () ->
           test_ws_add_rollback_and_ai_context vc_path);
       run_test "ws clean dry-run preserves workspace" (fun () ->
-          test_ws_clean_dry_run_preserves_workspace vc_path)
+          test_ws_clean_dry_run_preserves_workspace vc_path);
+      run_test "ws clean retry after partial failure" (fun () ->
+          test_ws_clean_retry_after_partial_failure vc_path)
   | _ -> fail "usage: mww_regression_tests <path-to-vc>"
