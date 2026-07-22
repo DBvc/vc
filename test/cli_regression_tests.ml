@@ -241,7 +241,7 @@ let test_legacy_root_md5_removed vc_path =
         "unknown command 'md5'")
 
 let test_root_help vc_path =
-  let completed = vc vc_path [ "--help" ] in
+  let completed = vc vc_path [ "--help=plain" ] in
   assert_contains "root help should describe the workflow console" completed.stdout
     "Personal developer workflow console.";
   assert_contains "root help should expose ai domain" completed.stdout "ai [COMMAND]";
@@ -254,7 +254,7 @@ let test_root_help vc_path =
     "md5 [OPTION]"
 
 let test_hash_help vc_path =
-  let completed = vc vc_path [ "hash"; "--help" ] in
+  let completed = vc vc_path [ "hash"; "--help=plain" ] in
   assert_contains "hash help should describe the hash command group" completed.stdout
     "vc hash COMMAND";
   assert_contains "hash help should list md5 subcommand" completed.stdout "md5";
@@ -263,7 +263,7 @@ let test_hash_help vc_path =
   assert_not_contains "hash help should not recommend legacy md5" completed.stdout "vc md5"
 
 let test_ai_help vc_path =
-  let completed = vc vc_path [ "ai"; "--help" ] in
+  let completed = vc vc_path [ "ai"; "--help=plain" ] in
   assert_contains "ai help should describe the command group" completed.stdout "vc ai [COMMAND]";
   assert_contains "ai help should document no built-in profiles" completed.stdout
     "built-in model";
