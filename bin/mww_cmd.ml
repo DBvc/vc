@@ -256,8 +256,8 @@ let parse_run_args loaded args =
   match args with
   | [] -> Error "command is required"
   | first :: rest when rest <> [] && workspace_exists loaded first ->
-      Ok (Some first, String.concat " " rest)
-  | _ -> Ok (None, String.concat " " args)
+      Ok (Some first, Proc.command_to_string rest)
+  | _ -> Ok (None, Proc.command_to_string args)
 
 let cmd_run config_path json repo_filters args =
   let result =
@@ -468,10 +468,10 @@ let ws_cmd =
 let run_cmd =
   let args =
     args_pos "[WORKSPACE] -- COMMAND ..."
-      "Command to run. Workspace is optional if cwd is inside one."
+      "Command to run. Workspace is optional if cwd is inside one. Use sh -c for shell expressions."
   in
   Cmd.v
-    (Cmd.info "run" ~doc:"Run a shell command in each repo worktree")
+    (Cmd.info "run" ~doc:"Run a command in each repo worktree")
     Term.(const cmd_run $ config_opt $ json_flag $ repo_filter_opt $ args)
 
 let push_cmd =

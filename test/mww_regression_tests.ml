@@ -371,6 +371,61 @@ let test_ws_clean_retry_after_partial_failure vc_path =
       assert_bool "successful retry should remove code workspace"
         (not (Sys.file_exists code_workspace)))
 
+let test_mww_run_preserves_argv vc_path =
+  with_temp_dir (fun root ->
+      let a_remote = create_repo root "a" in
+      let b_remote = create_repo root "b" in
+      let mww_root = root / "mww" in
+      init_mww_root vc_path mww_root;
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "repo"; "add"; "a"; a_remote ]);
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "repo"; "add"; "b"; b_remote ]);
+      ignore (vc vc_path ~cwd:mww_root [ "mww"; "ws"; "new"; "feat"; "a"; "b" ]);
+      let workspace_json = load_json (mww_root / "workspaces" / "feat" / ".mww-workspace.json") in
+      let a_worktree = string_field "worktree_path" (workspace_repo workspace_json "a") in
+      let assert_stdout label expected completed =
+        let results =
+          Yojson.Safe.from_string completed.stdout |> response_data |> list_field "results"
+        in
+        assert_bool (label ^ ": should run in both repos") (List.length results = 2);
+        List.iter
+          (fun result ->
+            assert_equal_string
+              (label ^ ": stdout for " ^ string_field "name" result)
+              expected (string_field "stdout" result))
+          results
+      in
+      let argv_run =
+        vc vc_path ~cwd:mww_root
+          [
+            "mww";
+            "run";
+            "--json";
+            "feat";
+            "--";
+            "printf";
+            "[%s]\\n";
+            "a b";
+            "";
+            "$HOME";
+            "*";
+            "semi;colon";
+          ]
+      in
+      assert_stdout "argv run" "[a b]\n[]\n[$HOME]\n[*]\n[semi;colon]\n" argv_run;
+      let shell_run =
+        vc vc_path ~cwd:a_worktree
+          [
+            "mww";
+            "run";
+            "--json";
+            "--";
+            "sh";
+            "-c";
+            "test -f README.md && printf '%s\\n' shell-ok";
+          ]
+      in
+      assert_stdout "explicit sh -c" "shell-ok\n" shell_run)
+
 let run_test name f =
   try
     f ();
@@ -392,5 +447,6 @@ let () =
       run_test "ws clean dry-run preserves workspace" (fun () ->
           test_ws_clean_dry_run_preserves_workspace vc_path);
       run_test "ws clean retry after partial failure" (fun () ->
-          test_ws_clean_retry_after_partial_failure vc_path)
+          test_ws_clean_retry_after_partial_failure vc_path);
+      run_test "mww run preserves argv" (fun () -> test_mww_run_preserves_argv vc_path)
   | _ -> fail "usage: mww_regression_tests <path-to-vc>"
